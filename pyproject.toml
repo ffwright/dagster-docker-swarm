@@ -1,0 +1,51 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "dagster-docker-swarm"
+version = "0.1.4"
+description = "A Dagster run launcher that executes pipeline runs as Docker Swarm services"
+readme = "README.md"
+license = { text = "Apache-2.0" }
+requires-python = ">=3.10"
+authors = [
+    { name = "Ffinlo Wright" },
+]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: OS Independent",
+]
+dependencies = [
+    "dagster>=1.9.0",
+    "docker>=7.0.0",
+    "docker-image-py>=0.1.12",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.4",
+]
+
+[project.urls]
+Homepage = "https://github.com/ffwright/dagster-docker-swarm"
+Repository = "https://github.com/ffwright/dagster-docker-swarm"
+Issues = "https://github.com/ffwright/dagster-docker-swarm/issues"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/dagster_docker_swarm"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
