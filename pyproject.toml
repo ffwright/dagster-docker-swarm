@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "dagster-docker-swarm"
-version = "0.1.4"
+version = "0.1.5"
 description = "A Dagster run launcher that executes pipeline runs as Docker Swarm services"
 readme = "README.md"
 license = { text = "Apache-2.0" }

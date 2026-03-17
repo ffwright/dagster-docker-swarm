@@ -253,7 +253,7 @@ class SwarmRunLauncher(RunLauncher, ConfigurableClass):
         try:
             service = client.services.create(
                 image=docker_image,
-                command=command,
+                args=command,
                 env=[f"{k}={v}" for k, v in docker_env.items()],
                 labels=labels,
                 name=service_name,
