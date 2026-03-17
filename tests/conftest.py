@@ -13,10 +13,11 @@ def make_mock_run(run_id="abc12345-def6-7890-abcd-ef1234567890", job_name="my_jo
     return run
 
 
-def make_mock_job_code_origin(container_image=None):
+def make_mock_job_code_origin(container_image=None, container_context=None):
     """Create a mock job code origin."""
     origin = MagicMock()
     origin.repository_origin.container_image = container_image
+    origin.repository_origin.container_context = container_context
     return origin
 
 
