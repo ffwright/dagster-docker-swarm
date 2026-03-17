@@ -344,3 +344,191 @@ class TestTerminate:
         mock_instance.get_run_by_id.return_value = run
         assert launcher.terminate(run.run_id) is True
         service.remove.assert_called_once()
+
+
+class TestLaunchService:
+    """Tests for launch_run, resume_run, and _launch_service_with_command."""
+
+    def _make_launcher_with_instance(self, mock_docker_client, **launcher_kwargs):
+        launcher_kwargs.setdefault("cleanup_interval", 0)
+        with patch("docker.client.from_env", return_value=mock_docker_client):
+            launcher = SwarmRunLauncher(**launcher_kwargs)
+            mock_instance = MagicMock()
+            launcher.register_instance(mock_instance)
+            return launcher, mock_instance
+
+    def _make_context(self, run, origin, context_cls="launch"):
+        context = MagicMock()
+        context.dagster_run = run
+        context.job_code_origin = origin
+        return context
+
+    def _setup_create(self, mock_docker_client, service_id="svc-new-123"):
+        mock_service = MagicMock()
+        mock_service.id = service_id
+        mock_docker_client.services.create.return_value = mock_service
+        return mock_service
+
+    def test_launch_run_uses_args_not_command(self, mock_docker_client):
+        """The dagster command must be passed as args= (CMD), not command= (ENTRYPOINT)."""
+        self._setup_create(mock_docker_client)
+        launcher, _ = self._make_launcher_with_instance(mock_docker_client, image="img:v1")
+        origin = make_mock_job_code_origin(container_image="img:v1")
+        run = make_mock_run()
+        context = self._make_context(run, origin)
+
+        with patch("dagster_docker_swarm.run_launcher.ExecuteRunArgs") as MockArgs:
+            MockArgs.return_value.get_command_args.return_value = ["dagster", "api", "execute_run"]
+            launcher.launch_run(context)
+
+        call_kwargs = mock_docker_client.services.create.call_args
+        assert "args" in call_kwargs.kwargs
+        assert call_kwargs.kwargs["args"] == ["dagster", "api", "execute_run"]
+        assert "command" not in call_kwargs.kwargs
+
+    def test_resume_run_uses_args_not_command(self, mock_docker_client):
+        """resume_run should also use args= not command=."""
+        self._setup_create(mock_docker_client)
+        launcher, _ = self._make_launcher_with_instance(mock_docker_client, image="img:v1")
+        origin = make_mock_job_code_origin(container_image="img:v1")
+        run = make_mock_run()
+        context = self._make_context(run, origin)
+
+        with patch("dagster_docker_swarm.run_launcher.ResumeRunArgs") as MockArgs:
+            MockArgs.return_value.get_command_args.return_value = ["dagster", "api", "resume_run"]
+            launcher.resume_run(context)
+
+        call_kwargs = mock_docker_client.services.create.call_args
+        assert "args" in call_kwargs.kwargs
+        assert call_kwargs.kwargs["args"] == ["dagster", "api", "resume_run"]
+        assert "command" not in call_kwargs.kwargs
+
+    def test_launch_run_passes_env_vars(self, mock_docker_client):
+        """Env vars from config are resolved and passed to the service."""
+        self._setup_create(mock_docker_client)
+        launcher, _ = self._make_launcher_with_instance(
+            mock_docker_client, image="img:v1", env_vars=["FOO=bar", "BAZ=qux"],
+        )
+        origin = make_mock_job_code_origin(container_image="img:v1")
+        run = make_mock_run()
+        context = self._make_context(run, origin)
+
+        with patch("dagster_docker_swarm.run_launcher.ExecuteRunArgs") as MockArgs:
+            MockArgs.return_value.get_command_args.return_value = ["dagster", "api", "execute_run"]
+            launcher.launch_run(context)
+
+        call_kwargs = mock_docker_client.services.create.call_args.kwargs
+        env_list = call_kwargs["env"]
+        env_dict = dict(item.split("=", 1) for item in env_list)
+        assert env_dict["FOO"] == "bar"
+        assert env_dict["BAZ"] == "qux"
+        assert env_dict["DAGSTER_RUN_JOB_NAME"] == "my_job"
+
+    def test_launch_run_passes_mounts(self, mock_docker_client):
+        """Mounts with driver_config are correctly constructed."""
+        self._setup_create(mock_docker_client)
+        launcher, _ = self._make_launcher_with_instance(
+            mock_docker_client,
+            image="img:v1",
+            mounts=[{
+                "target": "/data",
+                "source": "my_vol",
+                "type": "volume",
+                "driver_config": {"Name": "local", "Options": {"type": "nfs"}},
+            }],
+        )
+        origin = make_mock_job_code_origin(container_image="img:v1")
+        run = make_mock_run()
+        context = self._make_context(run, origin)
+
+        with patch("dagster_docker_swarm.run_launcher.ExecuteRunArgs") as MockArgs:
+            MockArgs.return_value.get_command_args.return_value = ["dagster", "api", "execute_run"]
+            launcher.launch_run(context)
+
+        call_kwargs = mock_docker_client.services.create.call_args.kwargs
+        mounts = call_kwargs["mounts"]
+        assert len(mounts) == 1
+        assert mounts[0]["Target"] == "/data"
+        assert mounts[0]["Source"] == "my_vol"
+
+    def test_launch_run_passes_networks(self, mock_docker_client):
+        """Networks are forwarded to services.create."""
+        self._setup_create(mock_docker_client)
+        launcher, _ = self._make_launcher_with_instance(
+            mock_docker_client, image="img:v1", networks=["net-a", "net-b"],
+        )
+        origin = make_mock_job_code_origin(container_image="img:v1")
+        run = make_mock_run()
+        context = self._make_context(run, origin)
+
+        with patch("dagster_docker_swarm.run_launcher.ExecuteRunArgs") as MockArgs:
+            MockArgs.return_value.get_command_args.return_value = ["dagster", "api", "execute_run"]
+            launcher.launch_run(context)
+
+        call_kwargs = mock_docker_client.services.create.call_args.kwargs
+        assert call_kwargs["networks"] == ["net-a", "net-b"]
+
+    def test_launch_run_passes_service_kwargs(self, mock_docker_client):
+        """Extra service_kwargs are spread into services.create."""
+        self._setup_create(mock_docker_client)
+        launcher, _ = self._make_launcher_with_instance(
+            mock_docker_client, image="img:v1", service_kwargs={"user": "dagster"},
+        )
+        origin = make_mock_job_code_origin(container_image="img:v1")
+        run = make_mock_run()
+        context = self._make_context(run, origin)
+
+        with patch("dagster_docker_swarm.run_launcher.ExecuteRunArgs") as MockArgs:
+            MockArgs.return_value.get_command_args.return_value = ["dagster", "api", "execute_run"]
+            launcher.launch_run(context)
+
+        call_kwargs = mock_docker_client.services.create.call_args.kwargs
+        assert call_kwargs["user"] == "dagster"
+
+    def test_launch_run_reports_engine_event_and_tags(self, mock_docker_client):
+        """Engine event is reported and service ID / image tags are added to the run."""
+        mock_service = self._setup_create(mock_docker_client, service_id="svc-abc")
+        launcher, mock_instance = self._make_launcher_with_instance(
+            mock_docker_client, image="img:v1",
+        )
+        origin = make_mock_job_code_origin(container_image="img:v1")
+        run = make_mock_run()
+        context = self._make_context(run, origin)
+
+        with patch("dagster_docker_swarm.run_launcher.ExecuteRunArgs") as MockArgs:
+            MockArgs.return_value.get_command_args.return_value = ["dagster", "api", "execute_run"]
+            launcher.launch_run(context)
+
+        mock_instance.report_engine_event.assert_called_once()
+        mock_instance.add_run_tags.assert_called_once()
+        tag_args = mock_instance.add_run_tags.call_args
+        tags = tag_args[0][1]
+        assert tags[SWARM_SERVICE_ID_TAG] == "svc-abc"
+
+    def test_launch_run_service_name_format(self, mock_docker_client):
+        """Service name is dagster-run-{first 8 chars of run_id}."""
+        self._setup_create(mock_docker_client)
+        launcher, _ = self._make_launcher_with_instance(mock_docker_client, image="img:v1")
+        origin = make_mock_job_code_origin(container_image="img:v1")
+        run = make_mock_run(run_id="abcdef12-3456-7890-abcd-ef1234567890")
+        context = self._make_context(run, origin)
+
+        with patch("dagster_docker_swarm.run_launcher.ExecuteRunArgs") as MockArgs:
+            MockArgs.return_value.get_command_args.return_value = ["dagster", "api", "execute_run"]
+            launcher.launch_run(context)
+
+        call_kwargs = mock_docker_client.services.create.call_args.kwargs
+        assert call_kwargs["name"] == "dagster-run-abcdef12"
+
+    def test_launch_run_api_error_propagates(self, mock_docker_client):
+        """Docker API errors during service creation bubble up."""
+        mock_docker_client.services.create.side_effect = docker.errors.APIError("create failed")
+        launcher, _ = self._make_launcher_with_instance(mock_docker_client, image="img:v1")
+        origin = make_mock_job_code_origin(container_image="img:v1")
+        run = make_mock_run()
+        context = self._make_context(run, origin)
+
+        with patch("dagster_docker_swarm.run_launcher.ExecuteRunArgs") as MockArgs:
+            MockArgs.return_value.get_command_args.return_value = ["dagster", "api", "execute_run"]
+            with pytest.raises(docker.errors.APIError, match="create failed"):
+                launcher.launch_run(context)
