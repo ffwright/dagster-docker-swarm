@@ -27,6 +27,60 @@ Add to your `dagster.yaml`:
             source: shared_data
             type: volume
 
+### Per-code-location config (`container_context`)
+
+Each code location can extend the launcher's instance-level config by declaring
+its own `container_context` on the `Definitions(...)` it serves. The launcher
+reads the `docker_swarm` sub-dict and merges it with the launcher config at
+run-launch time:
+
+    # In a code location's repository.py
+    from dagster import Definitions
+
+    defs = Definitions(
+        assets=[...],
+        container_context={
+            "docker_swarm": {
+                "env_vars": [
+                    "CLICKHOUSE_HOST=clickhouse",
+                    "AZURE_HOST",                 # forwarded by name from the daemon env
+                ],
+                "networks": ["my_extra_network"],
+                "secrets": [
+                    {"secret_name": "myapp_db_password", "filename": "DB_PASSWORD"},
+                    {"secret_name": "myapp_api_key"},  # filename defaults to secret_name
+                ],
+            },
+        },
+    )
+
+Merge rules:
+
+- `env_vars`, `networks`, `mounts`, `secrets`: launcher list + code-location list (concatenated)
+- `registry`: code-location value replaces the launcher value when set
+- `service_kwargs`: shallow dict merge, code-location keys win
+
+### Swarm secrets
+
+The `secrets` field on either the launcher or a code-location accepts entries
+of the shape `{"secret_name": <swarm-secret-name>, "filename": <mount-name>}`.
+The launcher resolves each name to its Swarm-assigned UUID at launch time and
+attaches a `SecretReference` to the spawned service; the secret lands at
+`/run/secrets/<filename>` inside the run container. If `filename` is omitted
+it defaults to `secret_name`.
+
+A missing Swarm secret raises `DagsterInvariantViolationError` before the
+service is created, so launches fail fast with a named error.
+
+    run_launcher:
+      module: dagster_docker_swarm
+      class: SwarmRunLauncher
+      config:
+        image: my-registry/my-dagster-image:latest
+        secrets:
+          - secret_name: shared_clickhouse_password
+            filename: CLICKHOUSE_PASSWORD
+
 ### Service cleanup
 
 Completed Swarm services are cleaned up by a background thread that runs every
@@ -52,6 +106,8 @@ you prefer an external cron job).
 - Private registry authentication
 - NFS and custom volume driver mounts
 - Passthrough `service_kwargs` for advanced Swarm service configuration
+- Per-code-location config via `container_context` (env vars, networks, mounts, secrets)
+- First-class Docker Swarm secrets (`SecretReference` mounted at `/run/secrets/`)
 
 ## Requirements
 

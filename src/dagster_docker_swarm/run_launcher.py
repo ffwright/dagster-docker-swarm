@@ -5,6 +5,7 @@ from typing import Any, Optional
 import dagster._check as check
 import docker
 from dagster._config import Array, Field, IntSource, Permissive, StringSource
+from dagster._core.errors import DagsterInvariantViolationError
 from dagster._core.launcher.base import (
     CheckRunHealthResult,
     LaunchRunContext,
@@ -20,8 +21,10 @@ from dagster._serdes import ConfigurableClass
 from dagster._serdes.config_class import ConfigurableClassData
 from docker import DockerClient
 from docker.models.services import Service
-from docker.types import DriverConfig, Mount, RestartPolicy, ServiceMode
+from docker.types import DriverConfig, Mount, RestartPolicy, SecretReference, ServiceMode
 from docker_image import reference
+
+from dagster_docker_swarm.container_context import SwarmContainerContext
 
 logger = logging.getLogger("dagster_docker_swarm")
 
@@ -38,6 +41,7 @@ SWARM_CONFIG_SCHEMA = {
     "networks": Field(Array(StringSource), is_required=False),
     "mounts": Field([Permissive()], is_required=False),
     "service_kwargs": Field(Permissive(), is_required=False),
+    "secrets": Field([Permissive()], is_required=False),
     "cleanup_interval": Field(
         IntSource,
         is_required=False,
@@ -89,6 +93,7 @@ class SwarmRunLauncher(RunLauncher, ConfigurableClass):
         networks: Optional[list[str]] = None,
         mounts: Optional[list[dict[str, Any]]] = None,
         service_kwargs: Optional[dict[str, Any]] = None,
+        secrets: Optional[list[dict[str, Any]]] = None,
         cleanup_interval: int = 300,
     ) -> None:
         self._inst_data = inst_data
@@ -97,6 +102,7 @@ class SwarmRunLauncher(RunLauncher, ConfigurableClass):
         self.env_vars = env_vars
         self.mounts = mounts
         self.service_kwargs = service_kwargs
+        self.secrets = secrets
         self._cleanup_interval = cleanup_interval
         self._cleanup_shutdown: Optional[threading.Event] = None
         self._cleanup_thread: Optional[threading.Thread] = None
@@ -213,24 +219,70 @@ class SwarmRunLauncher(RunLauncher, ConfigurableClass):
             logger.exception("Docker API error looking up service %s for run %s", service_id, run.run_id)
             return None
 
-    def _launch_service_with_command(self, run: DagsterRun, docker_image: str, command: list[str]) -> None:
+    def _resolve_secret_references(
+        self,
+        client: DockerClient,
+        secrets: list[dict[str, Any]],
+        run: DagsterRun,
+    ) -> list[SecretReference]:
+        """Resolve a list of {secret_name, filename?} dicts to docker SecretReference objects.
+
+        Names are resolved to Swarm-assigned UUIDs once per launch via
+        ``client.secrets.list``. A missing secret raises before any service is
+        created so launches fail fast with a named error.
+        """
+        if not secrets:
+            return []
+
+        refs: list[SecretReference] = []
+        for entry in secrets:
+            name = entry.get("secret_name")
+            if not name:
+                raise DagsterInvariantViolationError(
+                    f"Swarm secret entry is missing 'secret_name': {entry!r}"
+                )
+            filename = entry.get("filename") or name
+
+            matches = [s for s in client.secrets.list(filters={"name": name}) if s.name == name]
+            if not matches:
+                raise DagsterInvariantViolationError(
+                    f"Swarm secret {name!r} declared on run {run.run_id} was not found on the swarm"
+                )
+            refs.append(SecretReference(secret_id=matches[0].id, secret_name=name, filename=filename))
+
+        logger.debug("Resolved %d secret(s) for run %s", len(refs), run.run_id)
+        return refs
+
+    def _launch_service_with_command(
+        self,
+        run: DagsterRun,
+        docker_image: str,
+        command: list[str],
+        container_context: SwarmContainerContext,
+    ) -> None:
         service_name = f"dagster-run-{run.run_id[:8]}"
         logger.info(
             "Launching Swarm service for run %s (job: %s, image: %s, service: %s)",
             run.run_id, run.job_name, docker_image, service_name,
         )
 
-        env_vars = self.env_vars or []
-        docker_env = dict([parse_env_var(env_var) for env_var in env_vars])
+        docker_env = dict([parse_env_var(env_var) for env_var in container_context.env_vars])
         docker_env["DAGSTER_RUN_JOB_NAME"] = run.job_name
         logger.debug("Resolved %d environment variables for run %s", len(docker_env), run.run_id)
 
-        client = self._get_client()
+        client = docker.client.from_env()
+        if container_context.registry:
+            logger.debug("Logging in to registry %s", container_context.registry["url"])
+            client.login(
+                registry=container_context.registry["url"],
+                username=container_context.registry["username"],
+                password=container_context.registry["password"],
+            )
 
         labels = {"dagster/run_id": run.run_id, "dagster/job_name": run.job_name}
 
         mounts: list[Mount] = []
-        for m in (self.mounts or []):
+        for m in container_context.mounts:
             driver_config = None
             if m.get("driver_config"):
                 driver_config = DriverConfig(
@@ -246,7 +298,9 @@ class SwarmRunLauncher(RunLauncher, ConfigurableClass):
         if mounts:
             logger.debug("Configured %d mount(s) for run %s", len(mounts), run.run_id)
 
-        service_kwargs = dict(self.service_kwargs or {})
+        secret_refs = self._resolve_secret_references(client, container_context.secrets, run)
+
+        service_kwargs = dict(container_context.service_kwargs)
         if service_kwargs:
             logger.debug("Passing additional service_kwargs: %s", list(service_kwargs.keys()))
 
@@ -258,7 +312,8 @@ class SwarmRunLauncher(RunLauncher, ConfigurableClass):
                 labels=labels,
                 name=service_name,
                 mounts=mounts,
-                networks=self.networks,
+                networks=container_context.networks,
+                secrets=secret_refs,
                 mode=ServiceMode("replicated", replicas=1),
                 restart_policy=RestartPolicy(condition="none"),
                 **service_kwargs,
@@ -291,24 +346,26 @@ class SwarmRunLauncher(RunLauncher, ConfigurableClass):
         logger.info("launch_run called for run %s (job: %s)", run.run_id, run.job_name)
         job_code_origin = check.not_none(context.job_code_origin)
         docker_image = self._get_docker_image(job_code_origin)
+        container_context = SwarmContainerContext.create_for_run(run, self)
         command = ExecuteRunArgs(
             job_origin=job_code_origin,
             run_id=run.run_id,
             instance_ref=self._instance.get_ref(),
         ).get_command_args()
-        self._launch_service_with_command(run, docker_image, command)
+        self._launch_service_with_command(run, docker_image, command, container_context)
 
     def resume_run(self, context: ResumeRunContext) -> None:
         run = context.dagster_run
         logger.info("resume_run called for run %s (job: %s)", run.run_id, run.job_name)
         job_code_origin = check.not_none(context.job_code_origin)
         docker_image = self._get_docker_image(job_code_origin)
+        container_context = SwarmContainerContext.create_for_run(run, self)
         command = ResumeRunArgs(
             job_origin=job_code_origin,
             run_id=run.run_id,
             instance_ref=self._instance.get_ref(),
         ).get_command_args()
-        self._launch_service_with_command(run, docker_image, command)
+        self._launch_service_with_command(run, docker_image, command, container_context)
 
     _TERMINAL_TASK_STATES = frozenset(("complete", "failed", "rejected", "orphaned", "shutdown"))
 
