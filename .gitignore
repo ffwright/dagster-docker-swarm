@@ -8,3 +8,4 @@ build/
 *.egg
 .ruff_cache/
 dagster-docker-swarm-plan.md
+.plans/

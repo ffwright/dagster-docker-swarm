@@ -3,7 +3,9 @@ from unittest.mock import MagicMock, patch
 
 import docker.errors
 import pytest
+from dagster._core.errors import DagsterInvariantViolationError
 
+from dagster_docker_swarm.container_context import DOCKER_SWARM_CONTAINER_CONTEXT_KEY
 from dagster_docker_swarm.run_launcher import SWARM_SERVICE_ID_TAG, SwarmRunLauncher
 from tests.conftest import make_mock_job_code_origin, make_mock_run
 
@@ -532,3 +534,309 @@ class TestLaunchService:
             MockArgs.return_value.get_command_args.return_value = ["dagster", "api", "execute_run"]
             with pytest.raises(docker.errors.APIError, match="create failed"):
                 launcher.launch_run(context)
+
+
+def _attach_origin(run, origin):
+    """Wire the code origin onto the run so create_for_run can find container_context."""
+    run.job_code_origin = origin
+    return run
+
+
+def _mock_swarm_secret(name, secret_id=None):
+    s = MagicMock()
+    s.name = name
+    s.id = secret_id or f"id-{name}"
+    return s
+
+
+class TestLaunchServiceWithContainerContext:
+    """Tests for the per-code-location container_context merge flow (DAG-74)."""
+
+    def _make_launcher_with_instance(self, mock_docker_client, **launcher_kwargs):
+        launcher_kwargs.setdefault("cleanup_interval", 0)
+        with patch("docker.client.from_env", return_value=mock_docker_client):
+            launcher = SwarmRunLauncher(**launcher_kwargs)
+            mock_instance = MagicMock()
+            launcher.register_instance(mock_instance)
+            return launcher, mock_instance
+
+    def _make_context(self, run, origin):
+        context = MagicMock()
+        context.dagster_run = run
+        context.job_code_origin = origin
+        return context
+
+    def _setup_create(self, mock_docker_client, service_id="svc-new-123"):
+        mock_service = MagicMock()
+        mock_service.id = service_id
+        mock_docker_client.services.create.return_value = mock_service
+
+    def _launch(self, launcher, run, origin):
+        with patch("dagster_docker_swarm.run_launcher.ExecuteRunArgs") as MockArgs:
+            MockArgs.return_value.get_command_args.return_value = ["dagster", "api", "execute_run"]
+            launcher.launch_run(self._make_context(run, origin))
+
+    def test_code_location_env_vars_appended(self, mock_docker_client):
+        self._setup_create(mock_docker_client)
+        launcher, _ = self._make_launcher_with_instance(
+            mock_docker_client, image="img:v1", env_vars=["INSTANCE=1"],
+        )
+        origin = make_mock_job_code_origin(
+            container_image="img:v1",
+            container_context={DOCKER_SWARM_CONTAINER_CONTEXT_KEY: {"env_vars": ["CL=2"]}},
+        )
+        run = _attach_origin(make_mock_run(), origin)
+        self._launch(launcher, run, origin)
+
+        env_list = mock_docker_client.services.create.call_args.kwargs["env"]
+        env_dict = dict(item.split("=", 1) for item in env_list)
+        assert env_dict["INSTANCE"] == "1"
+        assert env_dict["CL"] == "2"
+
+    def test_code_location_networks_appended(self, mock_docker_client):
+        self._setup_create(mock_docker_client)
+        launcher, _ = self._make_launcher_with_instance(
+            mock_docker_client, image="img:v1", networks=["net-instance"],
+        )
+        origin = make_mock_job_code_origin(
+            container_image="img:v1",
+            container_context={DOCKER_SWARM_CONTAINER_CONTEXT_KEY: {"networks": ["net-cl"]}},
+        )
+        run = _attach_origin(make_mock_run(), origin)
+        self._launch(launcher, run, origin)
+
+        assert mock_docker_client.services.create.call_args.kwargs["networks"] == [
+            "net-instance",
+            "net-cl",
+        ]
+
+    def test_code_location_registry_replaces_instance_and_logs_in(self, mock_docker_client):
+        self._setup_create(mock_docker_client)
+        launcher, _ = self._make_launcher_with_instance(
+            mock_docker_client,
+            image="img:v1",
+            registry={"url": "old.io", "username": "u1", "password": "p1"},
+        )
+        origin = make_mock_job_code_origin(
+            container_image="img:v1",
+            container_context={
+                DOCKER_SWARM_CONTAINER_CONTEXT_KEY: {
+                    "registry": {"url": "new.io", "username": "u2", "password": "p2"},
+                },
+            },
+        )
+        run = _attach_origin(make_mock_run(), origin)
+
+        # Reset login call history that earlier register_instance may have triggered.
+        mock_docker_client.login.reset_mock()
+        self._launch(launcher, run, origin)
+
+        # Registry login uses the merged (code-location) registry, not the instance one.
+        login_kwargs = mock_docker_client.login.call_args.kwargs
+        assert login_kwargs["registry"] == "new.io"
+        assert login_kwargs["username"] == "u2"
+
+    def test_code_location_mounts_appended(self, mock_docker_client):
+        self._setup_create(mock_docker_client)
+        launcher, _ = self._make_launcher_with_instance(
+            mock_docker_client,
+            image="img:v1",
+            mounts=[{"target": "/instance", "source": "vol_i", "type": "volume"}],
+        )
+        origin = make_mock_job_code_origin(
+            container_image="img:v1",
+            container_context={
+                DOCKER_SWARM_CONTAINER_CONTEXT_KEY: {
+                    "mounts": [{"target": "/cl", "source": "vol_c", "type": "volume"}],
+                },
+            },
+        )
+        run = _attach_origin(make_mock_run(), origin)
+        self._launch(launcher, run, origin)
+
+        mounts = mock_docker_client.services.create.call_args.kwargs["mounts"]
+        targets = sorted(m["Target"] for m in mounts)
+        assert targets == ["/cl", "/instance"]
+
+    def test_code_location_service_kwargs_shallow_merge(self, mock_docker_client):
+        self._setup_create(mock_docker_client)
+        launcher, _ = self._make_launcher_with_instance(
+            mock_docker_client,
+            image="img:v1",
+            service_kwargs={"user": "dagster", "hostname": "instance"},
+        )
+        origin = make_mock_job_code_origin(
+            container_image="img:v1",
+            container_context={
+                DOCKER_SWARM_CONTAINER_CONTEXT_KEY: {
+                    "service_kwargs": {"hostname": "cl", "stop_grace_period": 30},
+                },
+            },
+        )
+        run = _attach_origin(make_mock_run(), origin)
+        self._launch(launcher, run, origin)
+
+        kwargs = mock_docker_client.services.create.call_args.kwargs
+        assert kwargs["user"] == "dagster"
+        assert kwargs["hostname"] == "cl"
+        assert kwargs["stop_grace_period"] == 30
+
+
+class TestLaunchServiceSecrets:
+    """Tests for secrets resolution and SecretReference attachment (DAG-74)."""
+
+    def _make_launcher_with_instance(self, mock_docker_client, **launcher_kwargs):
+        launcher_kwargs.setdefault("cleanup_interval", 0)
+        with patch("docker.client.from_env", return_value=mock_docker_client):
+            launcher = SwarmRunLauncher(**launcher_kwargs)
+            mock_instance = MagicMock()
+            launcher.register_instance(mock_instance)
+            return launcher, mock_instance
+
+    def _make_context(self, run, origin):
+        context = MagicMock()
+        context.dagster_run = run
+        context.job_code_origin = origin
+        return context
+
+    def _setup_create(self, mock_docker_client):
+        mock_service = MagicMock()
+        mock_service.id = "svc-new-123"
+        mock_docker_client.services.create.return_value = mock_service
+
+    def _setup_secrets(self, mock_docker_client, name_to_id):
+        """Make client.secrets.list filter-by-name return matching mocked secrets."""
+
+        def _list(filters=None):
+            wanted = (filters or {}).get("name")
+            return [_mock_swarm_secret(n, sid) for n, sid in name_to_id.items() if n == wanted]
+
+        mock_docker_client.secrets.list.side_effect = _list
+
+    def _launch(self, launcher, run, origin):
+        with patch("dagster_docker_swarm.run_launcher.ExecuteRunArgs") as MockArgs:
+            MockArgs.return_value.get_command_args.return_value = ["dagster", "api", "execute_run"]
+            launcher.launch_run(self._make_context(run, origin))
+
+    def test_launcher_level_secrets_attached(self, mock_docker_client):
+        self._setup_create(mock_docker_client)
+        self._setup_secrets(mock_docker_client, {"my_secret": "id-my_secret"})
+        launcher, _ = self._make_launcher_with_instance(
+            mock_docker_client,
+            image="img:v1",
+            secrets=[{"secret_name": "my_secret", "filename": "MY_SECRET"}],
+        )
+        origin = make_mock_job_code_origin(container_image="img:v1")
+        run = _attach_origin(make_mock_run(), origin)
+        self._launch(launcher, run, origin)
+
+        refs = mock_docker_client.services.create.call_args.kwargs["secrets"]
+        assert len(refs) == 1
+        # SecretReference is a dict-like; assert the materialized fields.
+        assert refs[0]["SecretName"] == "my_secret"
+        assert refs[0]["SecretID"] == "id-my_secret"
+        assert refs[0]["File"]["Name"] == "MY_SECRET"
+
+    def test_code_location_secrets_attached(self, mock_docker_client):
+        self._setup_create(mock_docker_client)
+        self._setup_secrets(mock_docker_client, {"cl_secret": "id-cl_secret"})
+        launcher, _ = self._make_launcher_with_instance(mock_docker_client, image="img:v1")
+        origin = make_mock_job_code_origin(
+            container_image="img:v1",
+            container_context={
+                DOCKER_SWARM_CONTAINER_CONTEXT_KEY: {
+                    "secrets": [{"secret_name": "cl_secret"}],
+                },
+            },
+        )
+        run = _attach_origin(make_mock_run(), origin)
+        self._launch(launcher, run, origin)
+
+        refs = mock_docker_client.services.create.call_args.kwargs["secrets"]
+        assert len(refs) == 1
+        assert refs[0]["SecretName"] == "cl_secret"
+
+    def test_secrets_merged_from_both_layers(self, mock_docker_client):
+        self._setup_create(mock_docker_client)
+        self._setup_secrets(
+            mock_docker_client,
+            {"instance_secret": "id-i", "cl_secret": "id-c"},
+        )
+        launcher, _ = self._make_launcher_with_instance(
+            mock_docker_client,
+            image="img:v1",
+            secrets=[{"secret_name": "instance_secret"}],
+        )
+        origin = make_mock_job_code_origin(
+            container_image="img:v1",
+            container_context={
+                DOCKER_SWARM_CONTAINER_CONTEXT_KEY: {
+                    "secrets": [{"secret_name": "cl_secret"}],
+                },
+            },
+        )
+        run = _attach_origin(make_mock_run(), origin)
+        self._launch(launcher, run, origin)
+
+        refs = mock_docker_client.services.create.call_args.kwargs["secrets"]
+        names = sorted(r["SecretName"] for r in refs)
+        assert names == ["cl_secret", "instance_secret"]
+
+    def test_missing_secret_raises_before_create(self, mock_docker_client):
+        self._setup_create(mock_docker_client)
+        self._setup_secrets(mock_docker_client, {})  # no secrets exist on the swarm
+        launcher, _ = self._make_launcher_with_instance(
+            mock_docker_client,
+            image="img:v1",
+            secrets=[{"secret_name": "nope"}],
+        )
+        origin = make_mock_job_code_origin(container_image="img:v1")
+        run = _attach_origin(make_mock_run(), origin)
+
+        with pytest.raises(DagsterInvariantViolationError, match="'nope'"):
+            self._launch(launcher, run, origin)
+
+        mock_docker_client.services.create.assert_not_called()
+
+    def test_filename_defaults_to_secret_name(self, mock_docker_client):
+        self._setup_create(mock_docker_client)
+        self._setup_secrets(mock_docker_client, {"only_name": "id-only_name"})
+        launcher, _ = self._make_launcher_with_instance(
+            mock_docker_client,
+            image="img:v1",
+            secrets=[{"secret_name": "only_name"}],
+        )
+        origin = make_mock_job_code_origin(container_image="img:v1")
+        run = _attach_origin(make_mock_run(), origin)
+        self._launch(launcher, run, origin)
+
+        refs = mock_docker_client.services.create.call_args.kwargs["secrets"]
+        assert refs[0]["File"]["Name"] == "only_name"
+
+    def test_no_secrets_configured_passes_empty_list(self, mock_docker_client):
+        self._setup_create(mock_docker_client)
+        launcher, _ = self._make_launcher_with_instance(mock_docker_client, image="img:v1")
+        origin = make_mock_job_code_origin(container_image="img:v1")
+        run = _attach_origin(make_mock_run(), origin)
+        self._launch(launcher, run, origin)
+
+        assert mock_docker_client.services.create.call_args.kwargs["secrets"] == []
+        # No filter-by-name calls when there are no secrets to resolve.
+        mock_docker_client.secrets.list.assert_not_called()
+
+    def test_substring_name_match_rejected(self, mock_docker_client):
+        """client.secrets.list may return prefix/substring matches — we require exact name."""
+        self._setup_create(mock_docker_client)
+        mock_docker_client.secrets.list.return_value = [
+            _mock_swarm_secret("my_secret_v2"),  # close but not equal
+        ]
+        launcher, _ = self._make_launcher_with_instance(
+            mock_docker_client,
+            image="img:v1",
+            secrets=[{"secret_name": "my_secret"}],
+        )
+        origin = make_mock_job_code_origin(container_image="img:v1")
+        run = _attach_origin(make_mock_run(), origin)
+
+        with pytest.raises(DagsterInvariantViolationError, match="'my_secret'"):
+            self._launch(launcher, run, origin)
