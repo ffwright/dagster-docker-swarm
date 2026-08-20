@@ -1,4 +1,5 @@
 import logging
+import os
 import threading
 from typing import Any, Optional
 
@@ -29,6 +30,44 @@ from dagster_docker_swarm.container_context import SwarmContainerContext
 logger = logging.getLogger("dagster_docker_swarm")
 
 SWARM_SERVICE_ID_TAG = "swarm/service_id"
+
+DEFAULT_DOCKER_SOCKET_PATH = "/var/run/docker.sock"
+_UNIX_SOCKET_SCHEMES = ("unix://", "http+unix://")
+
+
+class _MissingDockerSocketError(Exception):
+    """Raised when the Docker unix socket is absent from this process.
+
+    Distinct from a transient Docker error: a missing socket is a property of
+    how the process was started (the Dagster webserver deliberately does not
+    mount /var/run/docker.sock), so retrying cannot help.
+    """
+
+    def __init__(self, socket_path: str):
+        super().__init__(f"No Docker socket at {socket_path}")
+        self.socket_path = socket_path
+
+
+def _missing_docker_socket_path() -> Optional[str]:
+    """Return the Docker unix socket path if Docker would use one and it is absent.
+
+    Returns ``None`` when the socket exists, or when ``DOCKER_HOST`` points at a
+    non-unix transport (tcp://, ssh://) — there we cannot cheaply tell a
+    permanent misconfiguration from a transient daemon outage, so the caller
+    should treat the failure as transient.
+    """
+    docker_host = os.environ.get("DOCKER_HOST")
+    if not docker_host:
+        path = DEFAULT_DOCKER_SOCKET_PATH
+    else:
+        for scheme in _UNIX_SOCKET_SCHEMES:
+            if docker_host.startswith(scheme):
+                path = docker_host[len(scheme) :] or DEFAULT_DOCKER_SOCKET_PATH
+                break
+        else:
+            return None
+    return None if os.path.exists(path) else path
+
 
 SWARM_CONFIG_SCHEMA = {
     "image": Field(StringSource, is_required=False),
@@ -374,6 +413,17 @@ class SwarmRunLauncher(RunLauncher, ConfigurableClass):
         while not self._cleanup_shutdown.wait(self._cleanup_interval):
             try:
                 self._cleanup_orphaned_services()
+            except _MissingDockerSocketError as e:
+                # Permanent for this process: the socket is not mounted, so no
+                # amount of retrying will produce a Docker client. Log once and
+                # exit the thread instead of raising every interval forever.
+                logger.warning(
+                    "No Docker socket at %s in this process — Swarm service cleanup disabled. "
+                    "This is expected in the Dagster webserver, which does not mount the Docker "
+                    "socket; cleanup runs in the Dagster daemon.",
+                    e.socket_path,
+                )
+                return
             except Exception:
                 logger.warning("Unhandled error in cleanup loop", exc_info=True)
 
@@ -387,6 +437,16 @@ class SwarmRunLauncher(RunLauncher, ConfigurableClass):
         """
         try:
             client = self._get_client()
+        except Exception:
+            socket_path = _missing_docker_socket_path()
+            if socket_path is not None:
+                raise _MissingDockerSocketError(socket_path) from None
+            # Socket is there but the client still failed — engine restart or
+            # similar. Transient: log and retry on the next sweep.
+            logger.warning("Failed to create Docker client during cleanup", exc_info=True)
+            return
+
+        try:
             services = client.services.list(filters={"label": "dagster/run_id"})
         except Exception:
             logger.warning("Failed to list Swarm services during cleanup", exc_info=True)

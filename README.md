@@ -97,6 +97,13 @@ Completed Swarm services are cleaned up by a background thread that runs every
 Set `cleanup_interval: 0` to disable the background thread entirely (e.g. if
 you prefer an external cron job).
 
+The launcher is instantiated by *every* process that loads the Dagster
+instance, but only the daemon is given the Docker socket. In a process without
+`/var/run/docker.sock` (typically the webserver) the cleanup thread logs a
+single warning and exits, rather than raising on every sweep. Transient Docker
+errors — an engine restart, say — are retried as normal, so cleanup in the
+daemon survives them.
+
 ## Features
 
 - Launches each Dagster run as an isolated Swarm service (replicas=1, restart=none)

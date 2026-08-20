@@ -1,3 +1,4 @@
+import logging
 import time
 from unittest.mock import MagicMock, patch
 
@@ -6,7 +7,13 @@ import pytest
 from dagster._core.errors import DagsterInvariantViolationError
 
 from dagster_docker_swarm.container_context import DOCKER_SWARM_CONTAINER_CONTEXT_KEY
-from dagster_docker_swarm.run_launcher import SWARM_SERVICE_ID_TAG, SwarmRunLauncher
+from dagster_docker_swarm.run_launcher import (
+    DEFAULT_DOCKER_SOCKET_PATH,
+    SWARM_SERVICE_ID_TAG,
+    SwarmRunLauncher,
+    _missing_docker_socket_path,
+    _MissingDockerSocketError,
+)
 from tests.conftest import make_mock_job_code_origin, make_mock_run
 
 
@@ -840,3 +847,120 @@ class TestLaunchServiceSecrets:
 
         with pytest.raises(DagsterInvariantViolationError, match="'my_secret'"):
             self._launch(launcher, run, origin)
+
+
+class TestMissingDockerSocketPath:
+    """Unit tests for the socket-missing discriminator."""
+
+    def test_default_path_when_docker_host_unset(self, monkeypatch):
+        monkeypatch.delenv("DOCKER_HOST", raising=False)
+        with patch("os.path.exists", return_value=False):
+            assert _missing_docker_socket_path() == DEFAULT_DOCKER_SOCKET_PATH
+
+    def test_none_when_default_socket_exists(self, monkeypatch):
+        monkeypatch.delenv("DOCKER_HOST", raising=False)
+        with patch("os.path.exists", return_value=True):
+            assert _missing_docker_socket_path() is None
+
+    @pytest.mark.parametrize(
+        "docker_host,expected",
+        [
+            ("unix:///var/run/docker.sock", "/var/run/docker.sock"),
+            ("unix:///custom/docker.sock", "/custom/docker.sock"),
+            ("http+unix:///var/run/docker.sock", "/var/run/docker.sock"),
+            ("unix://", DEFAULT_DOCKER_SOCKET_PATH),
+            ("", DEFAULT_DOCKER_SOCKET_PATH),
+        ],
+    )
+    def test_unix_schemes_resolve_to_path(self, monkeypatch, docker_host, expected):
+        monkeypatch.setenv("DOCKER_HOST", docker_host)
+        with patch("os.path.exists", return_value=False):
+            assert _missing_docker_socket_path() == expected
+
+    @pytest.mark.parametrize("docker_host", ["tcp://swarm-manager:2375", "ssh://user@host"])
+    def test_non_unix_transport_is_not_classified(self, monkeypatch, docker_host):
+        """Remote transports have no socket to check — treat as transient."""
+        monkeypatch.setenv("DOCKER_HOST", docker_host)
+        with patch("os.path.exists", return_value=False):
+            assert _missing_docker_socket_path() is None
+
+
+class TestCleanupWithoutDockerSocket:
+    """Regression tests for the webserver case: no Docker socket in this process.
+
+    Before 0.2.1 the cleanup thread raised DockerException every
+    cleanup_interval, forever, in every process that loads the instance without
+    the socket mounted (notably the Dagster webserver).
+    """
+
+    SOCKET_ERROR = docker.errors.DockerException(
+        "Error while fetching server API version: "
+        "('Connection aborted.', FileNotFoundError(2, 'No such file or directory'))"
+    )
+
+    def test_sweep_raises_sentinel_when_socket_missing(self):
+        launcher = SwarmRunLauncher(cleanup_interval=0)
+        launcher.register_instance(MagicMock())
+
+        with (
+            patch("docker.client.from_env", side_effect=self.SOCKET_ERROR),
+            patch("dagster_docker_swarm.run_launcher._missing_docker_socket_path", return_value="/var/run/docker.sock"),
+            pytest.raises(_MissingDockerSocketError) as excinfo,
+        ):
+            launcher._cleanup_orphaned_services()
+
+        assert excinfo.value.socket_path == "/var/run/docker.sock"
+
+    def test_sweep_swallows_client_error_when_socket_present(self):
+        """Socket exists but the client failed: transient, no sentinel raised."""
+        launcher = SwarmRunLauncher(cleanup_interval=0)
+        launcher.register_instance(MagicMock())
+
+        with (
+            patch("docker.client.from_env", side_effect=self.SOCKET_ERROR),
+            patch("dagster_docker_swarm.run_launcher._missing_docker_socket_path", return_value=None),
+        ):
+            launcher._cleanup_orphaned_services()  # should not raise
+
+    def test_thread_stops_after_one_warning_when_socket_missing(self, caplog):
+        caplog.set_level(logging.WARNING, logger="dagster_docker_swarm")
+
+        with (
+            patch("docker.client.from_env", side_effect=self.SOCKET_ERROR) as mock_from_env,
+            patch("dagster_docker_swarm.run_launcher._missing_docker_socket_path", return_value="/var/run/docker.sock"),
+        ):
+            launcher = SwarmRunLauncher(cleanup_interval=1)
+            launcher.register_instance(MagicMock())
+            thread = launcher._cleanup_thread
+
+            thread.join(timeout=10)
+            assert not thread.is_alive(), "cleanup thread should exit when the socket is missing"
+
+            launcher.dispose()
+
+        assert mock_from_env.call_count == 1, "should not retry a permanently missing socket"
+
+        disabled = [r for r in caplog.records if "cleanup disabled" in r.getMessage()]
+        assert len(disabled) == 1
+        assert "/var/run/docker.sock" in disabled[0].getMessage()
+
+    def test_thread_survives_transient_docker_error(self):
+        """A daemon hiccup must not disable cleanup — the thread keeps retrying."""
+        with (
+            patch("docker.client.from_env", side_effect=self.SOCKET_ERROR) as mock_from_env,
+            patch("dagster_docker_swarm.run_launcher._missing_docker_socket_path", return_value=None),
+        ):
+            launcher = SwarmRunLauncher(cleanup_interval=1)
+            launcher.register_instance(MagicMock())
+            thread = launcher._cleanup_thread
+
+            deadline = time.time() + 10
+            while mock_from_env.call_count < 2 and time.time() < deadline:
+                time.sleep(0.05)
+
+            assert mock_from_env.call_count >= 2, "transient errors should be retried each interval"
+            assert thread.is_alive(), "thread must stay alive across transient errors"
+
+            launcher.dispose()
+
+        assert not thread.is_alive()
