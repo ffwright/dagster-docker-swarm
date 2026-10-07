@@ -80,6 +80,32 @@ class TestCheckRunWorkerHealth:
             return SwarmRunLauncher(cleanup_interval=0)
 
     def test_no_service_id_tag(self, mock_docker_client):
+        mock_docker_client.services.list.return_value = []
+        launcher = self._make_launcher(mock_docker_client)
+        run = make_mock_run(tags={})
+        result = launcher.check_run_worker_health(run)
+        assert result.status.name == "NOT_FOUND"
+        mock_docker_client.services.list.assert_called_once_with(
+            filters={"label": f"dagster/run_id={run.run_id}"}
+        )
+
+    def test_no_service_id_tag_falls_back_to_run_label(self, mock_docker_client):
+        # The tag can be lost from run_body when add_run_tags races the run
+        # worker's PIPELINE_START write; the labelled service is still there.
+        service = MagicMock()
+        service.id = "svc-labelled"
+        service.tasks.return_value = [
+            {"UpdatedAt": "2026-01-01T00:00:00Z", "Status": {"State": "running"}},
+        ]
+        mock_docker_client.services.list.return_value = [service]
+        launcher = self._make_launcher(mock_docker_client)
+        run = make_mock_run(tags={})
+        result = launcher.check_run_worker_health(run)
+        assert result.status.name == "RUNNING"
+        mock_docker_client.services.get.assert_not_called()
+
+    def test_no_service_id_tag_label_lookup_api_error(self, mock_docker_client):
+        mock_docker_client.services.list.side_effect = docker.errors.APIError("boom")
         launcher = self._make_launcher(mock_docker_client)
         run = make_mock_run(tags={})
         result = launcher.check_run_worker_health(run)
@@ -350,6 +376,15 @@ class TestTerminate:
         mock_docker_client.services.get.return_value = service
         launcher, mock_instance = self._make_launcher_with_instance(mock_docker_client)
         run = make_mock_run(tags={SWARM_SERVICE_ID_TAG: "svc-123"})
+        mock_instance.get_run_by_id.return_value = run
+        assert launcher.terminate(run.run_id) is True
+        service.remove.assert_called_once()
+
+    def test_terminate_without_tag_uses_run_label(self, mock_docker_client):
+        service = MagicMock()
+        mock_docker_client.services.list.return_value = [service]
+        launcher, mock_instance = self._make_launcher_with_instance(mock_docker_client)
+        run = make_mock_run(tags={})
         mock_instance.get_run_by_id.return_value = run
         assert launcher.terminate(run.run_id) is True
         service.remove.assert_called_once()
