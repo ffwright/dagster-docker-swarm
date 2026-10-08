@@ -252,21 +252,22 @@ class SwarmRunLauncher(RunLauncher, ConfigurableClass):
             return service
         except docker.errors.NotFound:
             logger.warning("Swarm service %s not found for run %s", service_id, run.run_id)
-            return None
+            return self._find_service_by_run_label(run)
         except docker.errors.APIError:
             logger.exception("Docker API error looking up service %s for run %s", service_id, run.run_id)
             return None
 
     def _find_service_by_run_label(self, run: DagsterRun) -> Optional[Service]:
-        """Find a run's service by its dagster/run_id label when the run has no
-        service ID tag.
+        """Find a run's service by its dagster/run_id label when the run's
+        service ID tag is missing or names a service that no longer exists.
 
         add_run_tags and handle_run_event both rewrite the run_body column from
         a read-then-write. If the daemon's add_run_tags lands after the run
-        worker's PIPELINE_START read, the START write puts back a body without
-        the tag. The tag is still in the run_tags table, but run.tags comes from
-        the body. The service is still labelled with the run id, so look it up
-        that way instead of reporting a live run as NOT_FOUND.
+        worker's PIPELINE_START read, the START write puts back the previous
+        body: without the tag on a first launch, or with the old service's ID
+        after a resume. The tag is still in the run_tags table, but run.tags
+        comes from the body. The service is still labelled with the run id, so
+        look it up that way instead of reporting a live run as NOT_FOUND.
         """
         try:
             services = self._get_client().services.list(
@@ -276,13 +277,16 @@ class SwarmRunLauncher(RunLauncher, ConfigurableClass):
             logger.exception("Docker API error listing services for run %s", run.run_id)
             return None
         if not services:
-            logger.debug("No service ID tag and no labelled service for run %s", run.run_id)
+            logger.debug("No service labelled dagster/run_id=%s", run.run_id)
             return None
+        # A resume creates a new service for the same run; if an earlier one
+        # was never removed, the newest is the live one.
+        service = max(services, key=lambda s: s.attrs.get("CreatedAt", ""))
         logger.warning(
-            "Run %s has no %s tag; found service %s by its dagster/run_id label",
-            run.run_id, SWARM_SERVICE_ID_TAG, services[0].id,
+            "Run %s: %s tag missing or stale; found service %s by its dagster/run_id label",
+            run.run_id, SWARM_SERVICE_ID_TAG, service.id,
         )
-        return services[0]
+        return service
 
     def _resolve_secret_references(
         self,
@@ -517,12 +521,14 @@ class SwarmRunLauncher(RunLauncher, ConfigurableClass):
             logger.info("Orphaned service cleanup removed %d service(s)", removed)
 
     def check_run_worker_health(self, run: DagsterRun) -> CheckRunHealthResult:
-        service_id = run.tags.get(SWARM_SERVICE_ID_TAG)
         service = self._get_service(run)
         if service is None:
-            if not service_id:
-                return CheckRunHealthResult(WorkerStatus.NOT_FOUND, msg="No Swarm service ID tag for run.")
-            return CheckRunHealthResult(WorkerStatus.NOT_FOUND, msg=f"Could not find Swarm service {service_id}.")
+            tagged = run.tags.get(SWARM_SERVICE_ID_TAG)
+            if tagged:
+                msg = f"Could not find Swarm service {tagged} or a service labelled dagster/run_id={run.run_id}."
+            else:
+                msg = f"No Swarm service ID tag for run and no service labelled dagster/run_id={run.run_id}."
+            return CheckRunHealthResult(WorkerStatus.NOT_FOUND, msg=msg)
         service_id = service.id
 
         tasks = service.tasks()

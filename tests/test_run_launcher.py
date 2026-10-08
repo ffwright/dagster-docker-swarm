@@ -113,10 +113,49 @@ class TestCheckRunWorkerHealth:
 
     def test_service_not_found(self, mock_docker_client):
         mock_docker_client.services.get.side_effect = docker.errors.NotFound("gone")
+        mock_docker_client.services.list.return_value = []
         launcher = self._make_launcher(mock_docker_client)
         run = make_mock_run(tags={SWARM_SERVICE_ID_TAG: "svc-123"})
         result = launcher.check_run_worker_health(run)
         assert result.status.name == "NOT_FOUND"
+        assert "svc-123" in result.msg
+
+    def test_stale_service_id_tag_falls_back_to_run_label(self, mock_docker_client):
+        # After a resume, the same race can leave the old service's ID in
+        # run_body; that service is gone but the new one carries the label.
+        mock_docker_client.services.get.side_effect = docker.errors.NotFound("gone")
+        service = MagicMock()
+        service.id = "svc-resumed"
+        service.tasks.return_value = [
+            {"UpdatedAt": "2026-01-01T00:00:00Z", "Status": {"State": "running"}},
+        ]
+        mock_docker_client.services.list.return_value = [service]
+        launcher = self._make_launcher(mock_docker_client)
+        run = make_mock_run(tags={SWARM_SERVICE_ID_TAG: "svc-old"})
+        result = launcher.check_run_worker_health(run)
+        assert result.status.name == "RUNNING"
+        mock_docker_client.services.list.assert_called_once_with(
+            filters={"label": f"dagster/run_id={run.run_id}"}
+        )
+
+    def test_label_fallback_picks_newest_service(self, mock_docker_client):
+        old = MagicMock()
+        old.attrs = {"CreatedAt": "2026-01-01T00:00:00Z"}
+        old.tasks.return_value = [
+            {"UpdatedAt": "2026-01-01T00:01:00Z", "Status": {"State": "failed", "Message": "old"}},
+        ]
+        new = MagicMock()
+        new.attrs = {"CreatedAt": "2026-01-01T00:05:00Z"}
+        new.tasks.return_value = [
+            {"UpdatedAt": "2026-01-01T00:05:00Z", "Status": {"State": "running"}},
+        ]
+        mock_docker_client.services.list.return_value = [new, old]
+        launcher = self._make_launcher(mock_docker_client)
+        result = launcher.check_run_worker_health(make_mock_run(tags={}))
+        assert result.status.name == "RUNNING"
+        mock_docker_client.services.list.return_value = [old, new]
+        result = launcher.check_run_worker_health(make_mock_run(tags={}))
+        assert result.status.name == "RUNNING"
 
     def test_task_running(self, mock_docker_client):
         service = MagicMock()
@@ -366,6 +405,7 @@ class TestTerminate:
 
     def test_terminate_no_service(self, mock_docker_client):
         mock_docker_client.services.get.side_effect = docker.errors.NotFound("gone")
+        mock_docker_client.services.list.return_value = []
         launcher, mock_instance = self._make_launcher_with_instance(mock_docker_client)
         run = make_mock_run(tags={SWARM_SERVICE_ID_TAG: "svc-123"})
         mock_instance.get_run_by_id.return_value = run
@@ -388,6 +428,9 @@ class TestTerminate:
         mock_instance.get_run_by_id.return_value = run
         assert launcher.terminate(run.run_id) is True
         service.remove.assert_called_once()
+        mock_docker_client.services.list.assert_called_once_with(
+            filters={"label": f"dagster/run_id={run.run_id}"}
+        )
 
 
 class TestLaunchService:
