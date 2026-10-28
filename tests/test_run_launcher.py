@@ -92,6 +92,23 @@ class TestCheckRunWorkerHealth:
             filters={"label": f"dagster/run_id={run.run_id}"}
         )
 
+    def test_does_not_log_in_to_registry(self, mock_docker_client):
+        """Inspecting a service needs no registry auth, so a registry outage cannot fail a health check."""
+        mock_docker_client.login.side_effect = docker.errors.APIError("registry unavailable")
+        service = MagicMock()
+        service.id = "svc-1"
+        service.tasks.return_value = [{"UpdatedAt": "2025-01-01T00:00:00Z", "Status": {"State": "running"}}]
+        mock_docker_client.services.get.return_value = service
+        with patch("docker.client.from_env", return_value=mock_docker_client):
+            launcher = SwarmRunLauncher(
+                cleanup_interval=0, registry={"url": "r.io", "username": "u", "password": "p"},
+            )
+
+        result = launcher.check_run_worker_health(make_mock_run(tags={SWARM_SERVICE_ID_TAG: "svc-1"}))
+
+        assert result.status.name == "RUNNING"
+        mock_docker_client.login.assert_not_called()
+
     def test_no_service_id_tag_falls_back_to_run_label(self, mock_docker_client):
         # The tag can be lost from run_body when add_run_tags races the run
         # worker's PIPELINE_START write; the labelled service is still there.

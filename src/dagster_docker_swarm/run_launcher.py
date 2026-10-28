@@ -246,16 +246,14 @@ class SwarmRunLauncher(RunLauncher, ConfigurableClass):
         self._stop_cleanup_thread()
 
     def _get_client(self) -> DockerClient:
+        """A Docker client for finding, inspecting and removing services.
+
+        It does not log in to the registry: none of those calls need it, and
+        logging in would send the credentials on every health check and sweep
+        and make both fail while the registry is down. Only a launch logs in.
+        """
         logger.debug("Creating Docker client from environment")
-        client = docker.client.from_env()
-        if self.registry:
-            logger.debug("Logging in to registry %s", self.registry["url"])
-            client.login(
-                registry=self.registry["url"],
-                username=self.registry["username"],
-                password=self.registry["password"],
-            )
-        return client
+        return docker.client.from_env()
 
     def _get_docker_image(self, job_code_origin: Any) -> str:
         docker_image = job_code_origin.repository_origin.container_image
