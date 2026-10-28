@@ -36,6 +36,7 @@ dev = [
 
 [project.urls]
 Homepage = "https://github.com/ffwright/dagster-docker-swarm"
+Changelog = "https://github.com/ffwright/dagster-docker-swarm/blob/main/CHANGELOG.md"
 Repository = "https://github.com/ffwright/dagster-docker-swarm"
 Issues = "https://github.com/ffwright/dagster-docker-swarm/issues"
 
@@ -46,7 +47,7 @@ packages = ["src/dagster_docker_swarm"]
 # Hatchling honours this repo's .gitignore but not personal git excludes, so an
 # sdist built from a working tree would otherwise pick up local files (editor
 # settings, review notes, scratch patches). 0.2.1's sdist shipped one.
-only-include = ["src", "tests", "README.md", "LICENSE", "pyproject.toml"]
+only-include = ["src", "tests", "README.md", "CHANGELOG.md", "LICENSE", "pyproject.toml"]
 
 [tool.ruff]
 line-length = 120
