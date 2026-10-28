@@ -288,8 +288,14 @@ class TestRemovalReason:
         """Run storage without the run-stats columns leaves end_time unset."""
         recent = datetime.fromtimestamp(self.NOW - 5, tz=timezone.utc)
         old = datetime.fromtimestamp(self.NOW - self.GRACE - 1, tz=timezone.utc)
-        assert self._reason("running", status=DagsterRunStatus.CANCELED, update_timestamp=recent) is None
-        assert self._reason("running", status=DagsterRunStatus.CANCELED, update_timestamp=old) is not None
+        assert self._reason("running", status=DagsterRunStatus.FAILURE, update_timestamp=recent) is None
+        assert self._reason("running", status=DagsterRunStatus.FAILURE, update_timestamp=old) is not None
+
+    def test_canceled_run_running_task_removed_without_grace(self):
+        """Nothing signalled this worker (force-terminate or the cancel timeout), so
+        waiting only lets it keep executing steps."""
+        reason = self._reason("running", status=DagsterRunStatus.CANCELED, end_time=self.NOW)
+        assert reason == "run CANCELED, task running"
 
 
 class TestCleanupOrphanedServices:
@@ -404,7 +410,7 @@ class TestCleanupOrphanedServices:
         orphan.remove.assert_not_called()
 
     def test_no_storage_query_without_run_ids(self, mock_docker_client):
-        """RunsFilter(run_ids=[]) would match every run, so it is never sent."""
+        """With no run IDs there is nothing to look up (and RunsFilter(run_ids=[]) raises)."""
         unlabeled = MagicMock()
         unlabeled.attrs = {"Spec": {"Labels": {"dagster/run_id": ""}}}
         unlabeled.tasks.return_value = [

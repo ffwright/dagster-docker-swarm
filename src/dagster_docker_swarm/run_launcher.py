@@ -509,10 +509,12 @@ class SwarmRunLauncher(RunLauncher, ConfigurableClass):
             # STARTING or STARTED: the monitoring daemon still health-checks
             # the run, and a pending task is a launch inside its start timeout.
             return None
-        if task_state == "running":
-            # Only a running task gets the grace period. A task still pulling
-            # or starting for a finished run is a late start, which should be
-            # stopped before its worker begins executing.
+        if task_state == "running" and status != DagsterRunStatus.CANCELED:
+            # Only a worker that wrote its own SUCCESS or FAILURE gets the grace
+            # period, to finish tearing down. A CANCELED run's worker is still
+            # running only if nothing signalled it (force-terminate, or Dagster's
+            # cancel timeout), and a task still pulling or starting for a
+            # finished run is a late start: both are stopped now.
             finished_at = record.end_time or record.update_timestamp.timestamp()
             if now - finished_at < cls._FINISHED_RUN_GRACE_SECONDS:
                 return None
@@ -554,8 +556,8 @@ class SwarmRunLauncher(RunLauncher, ConfigurableClass):
 
         # One query for the whole sweep. If run storage cannot be read, remove
         # nothing: an empty answer would make every service look "not in
-        # storage". And never query with no run IDs, because an empty
-        # RunsFilter(run_ids=[]) matches every run.
+        # storage". With no run IDs there is nothing to query, and
+        # RunsFilter(run_ids=[]) raises.
         records: dict[str, RunRecord] = {}
         labelled_run_ids = sorted({run_id for _, run_id in labelled if run_id})
         if labelled_run_ids:

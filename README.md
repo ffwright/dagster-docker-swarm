@@ -91,8 +91,9 @@ and removes a service when:
 - the run is SUCCESS, FAILURE or CANCELED, whatever the task is doing. This
   includes tasks that never started: Dagster's monitoring daemon fails a run
   that exceeds its start timeout without asking the launcher to stop it, and
-  each leftover service holds addresses on the overlay network. A task that is
-  still running is given 60 seconds after the run ends to exit on its own.
+  each leftover service holds addresses on the overlay network. A worker still
+  running after it recorded its run as SUCCESS or FAILURE is given 60 seconds
+  to finish shutting down; a CANCELED run's worker is stopped straight away.
 - the run is CANCELING (see *Terminating runs* below).
 - the run is not in run storage and Swarm reports the task finished. A service
   with no run in storage and a task still pending or running is left alone, as
@@ -127,9 +128,12 @@ terminated from the UI is terminated inside the webserver, which has no Docker
 socket. There the launcher marks the run CANCELING, records an engine event, and
 leaves the rest to the daemon: its next sweep removes the run's service, the
 worker receives SIGTERM, and Dagster records the run as CANCELED. Expect the
-worker to stop within one `cleanup_interval`. The UI's force-terminate option
-marks the run CANCELED straight away, so the worker also gets the 60-second
-grace before the sweep removes it. This relies on the daemon and the
+worker to stop within one `cleanup_interval`, with either terminate option in
+the UI. If Dagster's cancel timeout (`run_monitoring.cancel_timeout_seconds`,
+default 180) runs out first, Dagster marks the run CANCELED with a timeout
+message instead, and the sweep still stops the worker on its next pass. Set the
+cancel timeout above `cleanup_interval` to let the worker record the
+cancellation itself. This relies on the daemon and the
 webserver reading the same `cleanup_interval`; with `cleanup_interval: 0`,
 `terminate` in a process without the socket reports that it cannot stop the
 run.
