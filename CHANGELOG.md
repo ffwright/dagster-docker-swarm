@@ -29,6 +29,9 @@
   itself (`args`, `env`, `image`, `mode`, `mounts`, `name`, `networks`,
   `restart_policy`, `secrets`) still fail the launch, now with an error naming
   each key and the field to use instead.
+- A `resources` entry in `service_kwargs` with a top-level key other than
+  `Limits` or `Reservations`, such as docker-py's `mem_limit`, fails the launch.
+  The engine ignores such keys, so the run used to start with no limits.
 - Mount entries pass `read_only`, `consistency`, `propagation`, `no_copy`,
   `labels`, `tmpfs_size` and `tmpfs_mode` to Docker. They were dropped before,
   so a mount with `read_only: true` was writable. A `tmpfs` mount no longer
@@ -42,6 +45,9 @@
   60 (420 with the default interval), so that a run cancelled from the UI
   records its own cancellation. See *Terminating runs* in the README.
 - A mount with `read_only: true` is now read-only.
+- A `service_kwargs.resources` written with docker-py's names (`mem_limit`,
+  `cpu_limit`, ...) now fails every launch; it never applied any limits.
+  Rewrite it as `Limits` and `Reservations` with `MemoryBytes` and `NanoCPUs`.
 
 ### Other
 

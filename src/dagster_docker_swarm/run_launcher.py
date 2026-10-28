@@ -2,6 +2,7 @@ import logging
 import os
 import threading
 import time
+from collections.abc import Mapping
 from typing import Any, Optional
 
 import dagster._check as check
@@ -88,6 +89,11 @@ _SERVICE_KWARGS_SET_BY_LAUNCHER = {
 # docker.types.Mount options passed through from a mounts entry as given.
 _MOUNT_OPTIONS = ("read_only", "consistency", "propagation", "no_copy", "labels", "tmpfs_size", "tmpfs_mode")
 
+# The Engine API's top-level resources keys. docker-py forwards a resources
+# dict unchanged and the engine ignores any other key, so a run configured with
+# docker-py's own names (mem_limit, cpu_limit) gets no limits and no error.
+_ENGINE_RESOURCES_KEYS = frozenset(("Limits", "Reservations"))
+
 
 def _check_service_kwargs(service_kwargs: dict[str, Any]) -> None:
     clashes = [
@@ -100,6 +106,20 @@ def _check_service_kwargs(service_kwargs: dict[str, Any]) -> None:
             "service_kwargs cannot set what the launcher sets on the Swarm service itself: "
             + ", ".join(clashes)
         )
+    labels = service_kwargs.get("labels")
+    if labels is not None and not isinstance(labels, Mapping):
+        raise DagsterInvariantViolationError(
+            f"service_kwargs.labels must map each label to its value, not be a {type(labels).__name__}"
+        )
+    resources = service_kwargs.get("resources")
+    if isinstance(resources, Mapping):
+        unknown = sorted(set(resources) - _ENGINE_RESOURCES_KEYS)
+        if unknown:
+            raise DagsterInvariantViolationError(
+                f"service_kwargs.resources has keys the Docker engine ignores: {', '.join(unknown)}, "
+                "so the run would get no limits. Use the Engine API's shape: Limits and "
+                "Reservations, each with NanoCPUs and MemoryBytes."
+            )
 
 
 SWARM_CONFIG_SCHEMA = {

@@ -850,6 +850,11 @@ class TestLaunchService:
             ({"env": ["A=1"]}, "env (use env_vars)"),
             ({"restart_policy": {"Condition": "any"}}, "restart_policy (Swarm must never restart a run)"),
             ({"mode": {}, "networks": ["n"]}, "mode (each run is a single replica), networks (use networks)"),
+            ({"labels": ["app=dagster"]}, "service_kwargs.labels must map each label to its value, not be a list"),
+            (
+                {"resources": {"mem_limit": "16g", "Limits": {"MemoryBytes": 1}}},
+                "service_kwargs.resources has keys the Docker engine ignores: mem_limit,",
+            ),
         ],
     )
     def test_service_kwargs_set_by_launcher_rejected(self, mock_docker_client, service_kwargs, expected):
@@ -865,6 +870,23 @@ class TestLaunchService:
                 launcher.launch_run(self._make_context(make_mock_run(), origin))
 
         mock_docker_client.services.create.assert_not_called()
+
+    def test_service_kwargs_engine_shaped_resources_passed_through(self, mock_docker_client):
+        self._setup_create(mock_docker_client)
+        resources = {
+            "Reservations": {"MemoryBytes": 2147483648, "NanoCPUs": 500000000},
+            "Limits": {"MemoryBytes": 17179869184, "NanoCPUs": 4000000000},
+        }
+        launcher, _ = self._make_launcher_with_instance(
+            mock_docker_client, image="img:v1", service_kwargs={"resources": resources},
+        )
+        origin = make_mock_job_code_origin(container_image="img:v1")
+
+        with patch("dagster_docker_swarm.run_launcher.ExecuteRunArgs") as MockArgs:
+            MockArgs.return_value.get_command_args.return_value = ["dagster", "api", "execute_run"]
+            launcher.launch_run(self._make_context(make_mock_run(), origin))
+
+        assert mock_docker_client.services.create.call_args.kwargs["resources"] == resources
 
     def test_mount_options_passed_through(self, mock_docker_client, caplog):
         """read_only and the other Mount options are honoured; a tmpfs mount needs no source."""

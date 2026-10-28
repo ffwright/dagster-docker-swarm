@@ -45,7 +45,9 @@ key is logged and ignored.
 part of the Swarm service spec that the launcher does not set itself. Write
 values that docker-py models as types (`resources`, `endpoint_spec`, ...) in the
 Docker Engine API's shape: docker-py forwards a dict unchanged, and the engine
-ignores keys it does not know without reporting an error.
+ignores keys it does not know without reporting an error. The launcher checks
+only the top level of `resources`, where a key other than `Limits` or
+`Reservations` (docker-py's `mem_limit`, say) fails the launch.
 
     service_kwargs:
       constraints:
