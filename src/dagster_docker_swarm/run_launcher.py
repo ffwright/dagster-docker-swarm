@@ -658,9 +658,10 @@ class SwarmRunLauncher(RunLauncher, ConfigurableClass):
         Dagster calls this in whichever process served the terminate request.
         For a request from the UI that is the webserver, which has no Docker
         socket. There the run is left CANCELING and the daemon's cleanup sweep
-        removes the service on its next pass (see ``_removal_reason``). That
-        relies on the daemon loading the same ``cleanup_interval`` as this
-        process, as it does when both read one dagster.yaml.
+        removes the service on its next pass (see ``_removal_reason``). The same
+        hand-off happens when Docker returns an error. That relies on the
+        daemon loading the same ``cleanup_interval`` as this process, as it
+        does when both read one dagster.yaml.
         """
         run = self._instance.get_run_by_id(run_id)
         if not run or run.is_finished:
@@ -674,50 +675,59 @@ class SwarmRunLauncher(RunLauncher, ConfigurableClass):
 
         socket_path = _missing_docker_socket_path()
         if socket_path is not None:
-            if self._cleanup_interval <= 0:
-                message = (
-                    f"No Docker socket at {socket_path} in this process and Swarm service "
-                    "cleanup is disabled (cleanup_interval: 0), so nothing can stop the "
-                    "run's Swarm service."
-                )
-                self._instance.report_engine_event(message=message, dagster_run=run, cls=self.__class__)
-                logger.warning("Cannot terminate run %s: %s", run_id, message)
-                return False
-            self._instance.report_engine_event(
-                message=(
-                    f"No Docker socket at {socket_path} in this process. The Dagster daemon's "
-                    f"Swarm service cleanup (every {self._cleanup_interval}s) will remove the "
-                    "run's service, which stops the run worker."
-                ),
-                dagster_run=run,
-                cls=self.__class__,
-            )
-            logger.info(
-                "No Docker socket at %s; run %s left CANCELING for the daemon's cleanup sweep",
-                socket_path,
-                run_id,
-            )
-            return True
+            return self._hand_off_to_cleanup(run, f"No Docker socket at {socket_path} in this process.")
 
-        service = self._get_service(run)
-        if not service:
-            self._instance.report_engine_event(
-                message="Unable to find Swarm service to send termination request to.",
-                dagster_run=run,
-                cls=self.__class__,
-            )
-            logger.warning("Cannot terminate run %s: Swarm service not found", run_id)
-            return False
-
-        service_id = service.id
         try:
-            service.remove()
-            logger.info("Removed Swarm service %s for terminated run %s", service_id, run_id)
-        except docker.errors.NotFound:
-            # The cleanup sweep or a health check removed it between the lookup
-            # and here; the worker is stopping either way.
-            logger.info("Swarm service %s for run %s was already removed", service_id, run_id)
-        except docker.errors.APIError:
-            logger.exception("Failed to remove Swarm service %s for run %s", service_id, run_id)
-            raise
+            service = self._get_service(run)
+            if not service:
+                self._instance.report_engine_event(
+                    message="Unable to find Swarm service to send termination request to.",
+                    dagster_run=run,
+                    cls=self.__class__,
+                )
+                logger.warning("Cannot terminate run %s: Swarm service not found", run_id)
+                return False
+
+            service_id = service.id
+            try:
+                service.remove()
+                logger.info("Removed Swarm service %s for terminated run %s", service_id, run_id)
+            except docker.errors.NotFound:
+                # The cleanup sweep or a health check removed it between the lookup
+                # and here; the worker is stopping either way.
+                logger.info("Swarm service %s for run %s was already removed", service_id, run_id)
+        except docker.errors.DockerException as e:
+            # An engine restart or a 503 during a manager election. Raising here
+            # would fail a backfill that is cancelling its runs, or abandon the
+            # rest of a bulk terminate in the UI; the run is already CANCELING,
+            # so the sweep can stop the worker once Docker answers again.
+            logger.warning("Docker error while terminating run %s", run_id, exc_info=True)
+            status = getattr(e, "status_code", None)
+            detail = f" ({status})" if status else ""
+            return self._hand_off_to_cleanup(
+                run, f"Docker error{detail} while removing the run's Swarm service."
+            )
+        return True
+
+    def _hand_off_to_cleanup(self, run: DagsterRun, problem: str) -> bool:
+        """Leave a CANCELING run for the cleanup sweep after this process failed
+        to remove its service. Returns whether anything will stop the worker."""
+        if self._cleanup_interval <= 0:
+            message = (
+                f"{problem} Swarm service cleanup is disabled (cleanup_interval: 0), so "
+                "nothing can stop the run's Swarm service."
+            )
+            self._instance.report_engine_event(message=message, dagster_run=run, cls=self.__class__)
+            logger.warning("Cannot terminate run %s: %s", run.run_id, message)
+            return False
+        self._instance.report_engine_event(
+            message=(
+                f"{problem} The Dagster daemon's Swarm service cleanup (every "
+                f"{self._cleanup_interval}s) will remove the run's service, which stops the "
+                "run worker."
+            ),
+            dagster_run=run,
+            cls=self.__class__,
+        )
+        logger.info("Run %s left CANCELING for the cleanup sweep: %s", run.run_id, problem)
         return True

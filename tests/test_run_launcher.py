@@ -595,6 +595,40 @@ class TestTerminate:
         mock_instance.get_run_by_id.return_value = run
         assert launcher.terminate(run.run_id) is True
 
+    @pytest.mark.parametrize("failing_call", ("lookup", "remove"))
+    def test_terminate_docker_error_hands_off_to_cleanup(self, mock_docker_client, failing_call):
+        """Raising would fail a cancelling backfill or abandon a bulk terminate;
+        the run is CANCELING, so the sweep stops the worker once Docker answers."""
+        error = docker.errors.APIError("Service Unavailable", response=MagicMock(status_code=503))
+        service = MagicMock()
+        if failing_call == "lookup":
+            mock_docker_client.services.get.side_effect = error
+        else:
+            mock_docker_client.services.get.return_value = service
+            service.remove.side_effect = error
+        launcher, mock_instance = self._make_launcher_with_instance(mock_docker_client)
+        launcher._cleanup_interval = 300
+        run = make_mock_run(tags={SWARM_SERVICE_ID_TAG: "svc-123"})
+        mock_instance.get_run_by_id.return_value = run
+
+        assert launcher.terminate(run.run_id) is True
+
+        mock_instance.report_run_canceling.assert_called_once_with(run)
+        message = mock_instance.report_engine_event.call_args.kwargs["message"]
+        assert "Docker error (503)" in message
+        assert "every 300s" in message
+
+    def test_terminate_docker_error_with_cleanup_disabled(self, mock_docker_client):
+        mock_docker_client.services.get.side_effect = docker.errors.APIError("boom")
+        launcher, mock_instance = self._make_launcher_with_instance(mock_docker_client)
+        run = make_mock_run(tags={SWARM_SERVICE_ID_TAG: "svc-123"})
+        mock_instance.get_run_by_id.return_value = run
+
+        assert launcher.terminate(run.run_id) is False
+
+        message = mock_instance.report_engine_event.call_args.kwargs["message"]
+        assert "cleanup is disabled" in message
+
     def test_terminate_without_socket_hands_off_to_cleanup(self, mock_docker_client):
         """In the webserver: leave the run CANCELING for the daemon's sweep."""
         launcher, mock_instance = self._make_launcher_with_instance(mock_docker_client)
