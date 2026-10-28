@@ -1,6 +1,7 @@
 import logging
 import os
 import threading
+import time
 from typing import Any, Optional
 
 import dagster._check as check
@@ -14,7 +15,7 @@ from dagster._core.launcher.base import (
     RunLauncher,
     WorkerStatus,
 )
-from dagster._core.storage.dagster_run import DagsterRun
+from dagster._core.storage.dagster_run import DagsterRun, DagsterRunStatus, RunRecord, RunsFilter
 from dagster._core.storage.tags import DOCKER_IMAGE_TAG
 from dagster._core.utils import parse_env_var
 from dagster._grpc.types import ExecuteRunArgs, ResumeRunArgs
@@ -438,6 +439,12 @@ class SwarmRunLauncher(RunLauncher, ConfigurableClass):
 
     _TERMINAL_TASK_STATES = frozenset(("complete", "failed", "rejected", "orphaned", "shutdown"))
 
+    # How long a worker may keep running after its run has finished before the
+    # sweep stops it. The worker writes the run's final event before its process
+    # exits, so a healthy one can still be tearing down for a few seconds after
+    # the run is SUCCESS or FAILURE.
+    _FINISHED_RUN_GRACE_SECONDS = 60
+
     def _cleanup_loop(self) -> None:
         """Background thread: periodically sweep orphaned Swarm services."""
         while not self._cleanup_shutdown.wait(self._cleanup_interval):
@@ -457,13 +464,64 @@ class SwarmRunLauncher(RunLauncher, ConfigurableClass):
             except Exception:
                 logger.warning("Unhandled error in cleanup loop", exc_info=True)
 
+    @classmethod
+    def _removal_reason(
+        cls, task_state: Optional[str], record: Optional[RunRecord], now: float
+    ) -> Optional[str]:
+        """Decide whether the cleanup sweep removes a service.
+
+        ``task_state`` is the state of the service's latest Swarm task, or
+        ``None`` if Swarm has not created one. ``record`` is the Dagster run the
+        service is labelled with, or ``None`` if it has no label or the run is
+        not in this instance's storage. Returns the reason to log, or ``None``
+        to leave the service alone.
+
+        Removing a service whose run is over, whatever its task is doing,
+        covers two leaks that nothing else in Dagster closes:
+
+        - A run that the monitoring daemon fails with ``START_TIMEOUT`` is only
+          marked FAILURE; ``terminate`` is never called. Its task stays
+          ``pending``/``preparing`` for good, holding a VIP and a task IP on
+          the overlay network. 414 of them exhausted a /24 on 2026-10-28.
+        - A run terminated from the UI: ``terminate`` runs in the webserver,
+          which has no Docker socket, so it leaves the run CANCELING (or the
+          UI's force option marks it CANCELED) and the worker keeps going.
+        """
+        if record is None:
+            # Nothing in storage says the run is over, and the service may belong
+            # to another Dagster instance on the same swarm: only remove what
+            # Swarm itself has finished with.
+            if task_state in cls._TERMINAL_TASK_STATES:
+                return f"task {task_state}, run not in storage"
+            return None
+
+        status = record.dagster_run.status
+        task = task_state or "not created"
+        if status == DagsterRunStatus.CANCELING:
+            # terminate() asked for the worker to stop but could not reach
+            # Docker. Removing the service sends the SIGTERM, and the worker
+            # records the run as CANCELED.
+            return f"run CANCELING, task {task}"
+        if not record.dagster_run.is_finished:
+            # STARTING or STARTED: the monitoring daemon still health-checks
+            # the run, and a pending task is a launch inside its start timeout.
+            return None
+        if task_state == "running":
+            # Only a running task gets the grace period. A task still pulling
+            # or starting for a finished run is a late start, which should be
+            # stopped before its worker begins executing.
+            finished_at = record.end_time or record.update_timestamp.timestamp()
+            if now - finished_at < cls._FINISHED_RUN_GRACE_SECONDS:
+                return None
+        return f"run {status.value}, task {task}"
+
     def _cleanup_orphaned_services(self) -> None:
         """Sweep all Swarm services labeled dagster/run_id and remove those
-        whose tasks have terminated AND whose corresponding Dagster run is
-        already in a terminal state (or no longer exists).
+        whose run no longer needs them; see ``_removal_reason`` for the rules.
 
         Safety: we cross-check Dagster's run storage so we never remove a
-        service that the monitoring daemon still needs to health-check.
+        service that the monitoring daemon still needs to health-check, and a
+        sweep that cannot read run storage removes nothing.
         """
         try:
             client = self._get_client()
@@ -482,35 +540,56 @@ class SwarmRunLauncher(RunLauncher, ConfigurableClass):
             logger.warning("Failed to list Swarm services during cleanup", exc_info=True)
             return
 
+        if not services:
+            return
+        # Read outside the per-service try below, so tolerate a null Spec or
+        # Labels rather than let one odd service abort the whole sweep.
+        labelled = [
+            (service, ((service.attrs.get("Spec") or {}).get("Labels") or {}).get("dagster/run_id"))
+            for service in services
+        ]
+
+        # One query for the whole sweep. If run storage cannot be read, remove
+        # nothing: an empty answer would make every service look "not in
+        # storage". And never query with no run IDs, because an empty
+        # RunsFilter(run_ids=[]) matches every run.
+        records: dict[str, RunRecord] = {}
+        labelled_run_ids = sorted({run_id for _, run_id in labelled if run_id})
+        if labelled_run_ids:
+            try:
+                for record in self._instance.get_run_records(
+                    filters=RunsFilter(run_ids=labelled_run_ids)
+                ):
+                    records[record.dagster_run.run_id] = record
+            except Exception:
+                logger.warning(
+                    "Failed to read run storage during cleanup; skipping this sweep",
+                    exc_info=True,
+                )
+                return
+
+        now = time.time()
         removed = 0
-        for service in services:
+        for service, run_id in labelled:
             try:
                 tasks = service.tasks()
-                if not tasks:
-                    continue
+                if tasks:
+                    latest_task = sorted(tasks, key=lambda t: t["UpdatedAt"], reverse=True)[0]
+                    state = latest_task["Status"]["State"]
+                else:
+                    state = None
 
-                latest_task = sorted(tasks, key=lambda t: t["UpdatedAt"], reverse=True)[0]
-                state = latest_task["Status"]["State"]
-                if state not in self._TERMINAL_TASK_STATES:
+                reason = self._removal_reason(state, records.get(run_id) if run_id else None, now)
+                if reason is None:
                     continue
-
-                # The Swarm task is done. Only remove the service if the Dagster
-                # run has also reached a terminal status — otherwise the
-                # monitoring daemon may still call check_run_worker_health for it
-                # and we'd cause a spurious NOT_FOUND → resume attempt.
-                run_id = service.attrs.get("Spec", {}).get("Labels", {}).get("dagster/run_id")
-                if run_id:
-                    dagster_run = self._instance.get_run_by_id(run_id)
-                    if dagster_run is not None and not dagster_run.is_finished:
-                        continue  # monitoring daemon will handle this one
 
                 service.remove()
                 removed += 1
                 logger.info(
-                    "Cleaned up orphaned service %s (run %s, task state: %s)",
+                    "Cleaned up Swarm service %s (run %s): %s",
                     service.id,
                     run_id or "unknown",
-                    state,
+                    reason,
                 )
             except docker.errors.NotFound:
                 pass  # already removed by another path

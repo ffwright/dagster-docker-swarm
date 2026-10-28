@@ -1,10 +1,12 @@
 import logging
 import time
+from datetime import datetime, timezone
 from unittest.mock import MagicMock, patch
 
 import docker.errors
 import pytest
 from dagster._core.errors import DagsterInvariantViolationError
+from dagster._core.storage.dagster_run import DagsterRunStatus
 
 from dagster_docker_swarm.container_context import DOCKER_SWARM_CONTAINER_CONTEXT_KEY
 from dagster_docker_swarm.run_launcher import (
@@ -14,7 +16,7 @@ from dagster_docker_swarm.run_launcher import (
     _missing_docker_socket_path,
     _MissingDockerSocketError,
 )
-from tests.conftest import make_mock_job_code_origin, make_mock_run
+from tests.conftest import make_mock_job_code_origin, make_mock_run, make_mock_run_record
 
 
 class TestSwarmRunLauncherInit:
@@ -216,14 +218,79 @@ class TestCheckRunWorkerHealth:
         assert result.status.name == "RUNNING"
 
 
+class TestRemovalReason:
+    """The sweep's decision for one service, from its task state and run record."""
+
+    GRACE = SwarmRunLauncher._FINISHED_RUN_GRACE_SECONDS
+    NOW = 1_800_000_000.0
+
+    def _reason(self, task_state, status=None, end_time=None, update_timestamp=None, in_storage=True):
+        record = None
+        if in_storage:
+            kwargs = {"update_timestamp": update_timestamp} if update_timestamp else {}
+            record = make_mock_run_record(status=status, end_time=end_time, **kwargs)
+        return SwarmRunLauncher._removal_reason(task_state, record, self.NOW)
+
+    @pytest.mark.parametrize("task_state", ("complete", "failed", "rejected", "orphaned", "shutdown"))
+    def test_run_not_in_storage_removed_once_task_terminal(self, task_state):
+        assert self._reason(task_state, in_storage=False) == f"task {task_state}, run not in storage"
+
+    @pytest.mark.parametrize("task_state", (None, "pending", "preparing", "running"))
+    def test_run_not_in_storage_kept_while_task_not_terminal(self, task_state):
+        """May belong to another Dagster instance on the same swarm."""
+        assert self._reason(task_state, in_storage=False) is None
+
+    @pytest.mark.parametrize("status", (DagsterRunStatus.STARTING, DagsterRunStatus.STARTED))
+    @pytest.mark.parametrize("task_state", (None, "new", "pending", "preparing", "running", "complete"))
+    def test_run_in_progress_kept(self, status, task_state):
+        assert self._reason(task_state, status=status) is None
+
+    @pytest.mark.parametrize("task_state", (None, "pending", "running", "complete"))
+    def test_canceling_run_removed(self, task_state):
+        """terminate() could not reach Docker; removing the service stops the worker."""
+        reason = self._reason(task_state, status=DagsterRunStatus.CANCELING)
+        assert reason is not None
+        assert reason.startswith("run CANCELING")
+
+    @pytest.mark.parametrize(
+        "status", (DagsterRunStatus.SUCCESS, DagsterRunStatus.FAILURE, DagsterRunStatus.CANCELED)
+    )
+    @pytest.mark.parametrize(
+        "task_state", (None, "new", "pending", "assigned", "accepted", "preparing", "starting")
+    )
+    def test_finished_run_with_task_not_running_removed(self, status, task_state):
+        """START_TIMEOUT leaves a FAILURE run whose task never started, holding its IPs."""
+        reason = self._reason(task_state, status=status, end_time=self.NOW)
+        assert reason == f"run {status.value}, task {task_state or 'not created'}"
+
+    def test_finished_run_running_task_kept_within_grace(self):
+        """The worker can still be tearing down after it wrote the run's last event."""
+        assert self._reason("running", status=DagsterRunStatus.SUCCESS, end_time=self.NOW - 5) is None
+
+    @pytest.mark.parametrize(
+        "status", (DagsterRunStatus.SUCCESS, DagsterRunStatus.FAILURE, DagsterRunStatus.CANCELED)
+    )
+    def test_finished_run_running_task_removed_after_grace(self, status):
+        reason = self._reason("running", status=status, end_time=self.NOW - self.GRACE)
+        assert reason == f"run {status.value}, task running"
+
+    def test_grace_falls_back_to_update_timestamp_without_end_time(self):
+        """Run storage without the run-stats columns leaves end_time unset."""
+        recent = datetime.fromtimestamp(self.NOW - 5, tz=timezone.utc)
+        old = datetime.fromtimestamp(self.NOW - self.GRACE - 1, tz=timezone.utc)
+        assert self._reason("running", status=DagsterRunStatus.CANCELED, update_timestamp=recent) is None
+        assert self._reason("running", status=DagsterRunStatus.CANCELED, update_timestamp=old) is not None
+
+
 class TestCleanupOrphanedServices:
-    """Tests for the background cleanup thread and sweep logic."""
+    """Tests for the sweep: Docker and run storage calls around _removal_reason."""
 
     def _make_launcher_with_instance(self, mock_docker_client, cleanup_interval=0):
         """Create a launcher with cleanup thread disabled (interval=0) for direct testing."""
         with patch("docker.client.from_env", return_value=mock_docker_client):
             launcher = SwarmRunLauncher(cleanup_interval=cleanup_interval)
             mock_instance = MagicMock()
+            mock_instance.get_run_records.return_value = []
             launcher.register_instance(mock_instance)
             return launcher, mock_instance
 
@@ -242,8 +309,9 @@ class TestCleanupOrphanedServices:
         mock_docker_client.services.list.return_value = [orphan]
 
         launcher, mock_instance = self._make_launcher_with_instance(mock_docker_client)
-        finished_run = make_mock_run(run_id="run-aaa", is_finished=True)
-        mock_instance.get_run_by_id.return_value = finished_run
+        mock_instance.get_run_records.return_value = [
+            make_mock_run_record(run_id="run-aaa", status=DagsterRunStatus.SUCCESS)
+        ]
 
         launcher._cleanup_orphaned_services()
 
@@ -253,8 +321,7 @@ class TestCleanupOrphanedServices:
         orphan = self._make_orphaned_service(run_id="run-deleted", task_state="complete")
         mock_docker_client.services.list.return_value = [orphan]
 
-        launcher, mock_instance = self._make_launcher_with_instance(mock_docker_client)
-        mock_instance.get_run_by_id.return_value = None  # run deleted from DB
+        launcher, _ = self._make_launcher_with_instance(mock_docker_client)  # run deleted from DB
 
         launcher._cleanup_orphaned_services()
 
@@ -266,27 +333,94 @@ class TestCleanupOrphanedServices:
         mock_docker_client.services.list.return_value = [service]
 
         launcher, mock_instance = self._make_launcher_with_instance(mock_docker_client)
-        active_run = make_mock_run(run_id="run-active", is_finished=False)
-        mock_instance.get_run_by_id.return_value = active_run
+        mock_instance.get_run_records.return_value = [
+            make_mock_run_record(run_id="run-active", status=DagsterRunStatus.STARTED)
+        ]
 
         launcher._cleanup_orphaned_services()
 
         service.remove.assert_not_called()
 
-    def test_skips_service_with_running_task(self, mock_docker_client):
-        service = MagicMock()
-        service.attrs = {"Spec": {"Labels": {"dagster/run_id": "run-bbb"}}}
-        service.tasks.return_value = [
-            {"Status": {"State": "running"}, "UpdatedAt": "2025-01-01T00:00:00Z"},
+    def test_removes_pending_service_of_timed_out_run(self, mock_docker_client):
+        """START_TIMEOUT marks the run FAILURE without terminating; its task never left pending."""
+        stuck = self._make_orphaned_service(run_id="run-timed-out", task_state="pending")
+        mock_docker_client.services.list.return_value = [stuck]
+
+        launcher, mock_instance = self._make_launcher_with_instance(mock_docker_client)
+        mock_instance.get_run_records.return_value = [
+            make_mock_run_record(run_id="run-timed-out", status=DagsterRunStatus.FAILURE)
         ]
+
+        launcher._cleanup_orphaned_services()
+
+        stuck.remove.assert_called_once()
+
+    def test_removes_running_worker_of_canceling_run(self, mock_docker_client):
+        """terminate() from the webserver leaves the run CANCELING; the sweep stops the worker."""
+        service = self._make_orphaned_service(run_id="run-terminated", task_state="running")
         mock_docker_client.services.list.return_value = [service]
+
+        launcher, mock_instance = self._make_launcher_with_instance(mock_docker_client)
+        mock_instance.get_run_records.return_value = [
+            make_mock_run_record(run_id="run-terminated", status=DagsterRunStatus.CANCELING)
+        ]
+
+        launcher._cleanup_orphaned_services()
+
+        service.remove.assert_called_once()
+
+    def test_looks_up_all_runs_in_one_query(self, mock_docker_client):
+        services = [self._make_orphaned_service(run_id=f"run-{i}") for i in (2, 1, 2)]
+        mock_docker_client.services.list.return_value = services
 
         launcher, mock_instance = self._make_launcher_with_instance(mock_docker_client)
 
         launcher._cleanup_orphaned_services()
 
-        service.remove.assert_not_called()
-        mock_instance.get_run_by_id.assert_not_called()  # shouldn't even check
+        mock_instance.get_run_records.assert_called_once()
+        assert mock_instance.get_run_records.call_args.kwargs["filters"].run_ids == ["run-1", "run-2"]
+        mock_instance.get_run_by_id.assert_not_called()
+
+    def test_skips_sweep_when_run_storage_unreadable(self, mock_docker_client):
+        """A failed lookup must not make every run look deleted."""
+        orphan = self._make_orphaned_service(run_id="run-aaa", task_state="complete")
+        mock_docker_client.services.list.return_value = [orphan]
+
+        launcher, mock_instance = self._make_launcher_with_instance(mock_docker_client)
+        mock_instance.get_run_records.side_effect = Exception("database is locked")
+
+        launcher._cleanup_orphaned_services()
+
+        orphan.remove.assert_not_called()
+
+    def test_no_storage_query_without_run_ids(self, mock_docker_client):
+        """RunsFilter(run_ids=[]) would match every run, so it is never sent."""
+        unlabeled = MagicMock()
+        unlabeled.attrs = {"Spec": {"Labels": {"dagster/run_id": ""}}}
+        unlabeled.tasks.return_value = [
+            {"Status": {"State": "complete"}, "UpdatedAt": "2025-01-01T00:00:00Z"},
+        ]
+        mock_docker_client.services.list.return_value = [unlabeled]
+
+        launcher, mock_instance = self._make_launcher_with_instance(mock_docker_client)
+
+        launcher._cleanup_orphaned_services()
+
+        mock_instance.get_run_records.assert_not_called()
+        unlabeled.remove.assert_called_once()
+
+    def test_null_labels_do_not_abort_sweep(self, mock_docker_client):
+        odd = MagicMock()
+        odd.attrs = {"Spec": {"Labels": None}}
+        odd.tasks.return_value = []
+        orphan = self._make_orphaned_service(run_id="run-aaa", task_state="complete")
+        mock_docker_client.services.list.return_value = [odd, orphan]
+
+        launcher, _ = self._make_launcher_with_instance(mock_docker_client)
+
+        launcher._cleanup_orphaned_services()
+
+        orphan.remove.assert_called_once()
 
     def test_handles_already_removed_service(self, mock_docker_client):
         """NotFound during remove is silently ignored (another path cleaned it)."""
@@ -294,8 +428,7 @@ class TestCleanupOrphanedServices:
         orphan.remove.side_effect = docker.errors.NotFound("already gone")
         mock_docker_client.services.list.return_value = [orphan]
 
-        launcher, mock_instance = self._make_launcher_with_instance(mock_docker_client)
-        mock_instance.get_run_by_id.return_value = None
+        launcher, _ = self._make_launcher_with_instance(mock_docker_client)
 
         # Should not raise
         launcher._cleanup_orphaned_services()
@@ -316,8 +449,7 @@ class TestCleanupOrphanedServices:
             services.append(svc)
         mock_docker_client.services.list.return_value = services
 
-        launcher, mock_instance = self._make_launcher_with_instance(mock_docker_client)
-        mock_instance.get_run_by_id.return_value = None  # all deleted
+        launcher, _ = self._make_launcher_with_instance(mock_docker_client)  # all deleted
 
         launcher._cleanup_orphaned_services()
 

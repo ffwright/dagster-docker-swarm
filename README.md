@@ -83,8 +83,24 @@ service is created, so launches fail fast with a named error.
 
 ### Service cleanup
 
-Completed Swarm services are cleaned up by a background thread that runs every
-`cleanup_interval` seconds (default 300). To run sweeps more frequently:
+A background thread removes the Swarm services of runs that no longer need them,
+every `cleanup_interval` seconds (default 300). On each sweep it reads the runs
+behind all `dagster/run_id`-labelled services from run storage in one query,
+and removes a service when:
+
+- the run is SUCCESS, FAILURE or CANCELED, whatever the task is doing. This
+  includes tasks that never started: Dagster's monitoring daemon fails a run
+  that exceeds its start timeout without asking the launcher to stop it, and
+  each leftover service holds addresses on the overlay network. A task that is
+  still running is given 60 seconds after the run ends to exit on its own.
+- the run is CANCELING (see *Terminating runs* below).
+- the run is not in run storage and Swarm reports the task finished. A service
+  with no run in storage and a task still pending or running is left alone, as
+  it may belong to another Dagster instance on the same swarm.
+
+Services of runs that are STARTING or STARTED are never touched. If run
+storage cannot be read, the sweep removes nothing and tries again next time.
+To run sweeps more frequently:
 
     run_launcher:
       module: dagster_docker_swarm
