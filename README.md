@@ -92,8 +92,9 @@ and removes a service when:
   includes tasks that never started: Dagster's monitoring daemon fails a run
   that exceeds its start timeout without asking the launcher to stop it, and
   each leftover service holds addresses on the overlay network. A worker still
-  running after it recorded its run as SUCCESS or FAILURE is given 60 seconds
-  to finish shutting down; a CANCELED run's worker is stopped straight away.
+  running 60 seconds after its run ended SUCCESS or FAILURE is stopped (the
+  wait lets a worker that finished normally shut down); a CANCELED run's worker
+  is stopped straight away.
 - the run is CANCELING (see *Terminating runs* below).
 - the run is not in run storage and Swarm reports the task finished. A service
   with no run in storage and a task still pending or running is left alone, as
@@ -132,8 +133,10 @@ worker to stop within one `cleanup_interval`, with either terminate option in
 the UI. If Dagster's cancel timeout (`run_monitoring.cancel_timeout_seconds`,
 default 180) runs out first, Dagster marks the run CANCELED with a timeout
 message instead, and the sweep still stops the worker on its next pass. Set the
-cancel timeout above `cleanup_interval` to let the worker record the
-cancellation itself. This relies on the daemon and the
+cancel timeout to at least `cleanup_interval` + 60 to let the worker record the
+cancellation itself. If Docker returns an error while `terminate` removes the
+service, the run is likewise left CANCELING for the sweep. This relies on the
+daemon and the
 webserver reading the same `cleanup_interval`; with `cleanup_interval: 0`,
 `terminate` in a process without the socket reports that it cannot stop the
 run.

@@ -510,11 +510,13 @@ class SwarmRunLauncher(RunLauncher, ConfigurableClass):
             # the run, and a pending task is a launch inside its start timeout.
             return None
         if task_state == "running" and status != DagsterRunStatus.CANCELED:
-            # Only a worker that wrote its own SUCCESS or FAILURE gets the grace
-            # period, to finish tearing down. A CANCELED run's worker is still
-            # running only if nothing signalled it (force-terminate, or Dagster's
-            # cancel timeout), and a task still pulling or starting for a
-            # finished run is a late start: both are stopped now.
+            # Only a SUCCESS or FAILURE run's worker gets the grace period, in
+            # case it wrote that status itself and is still tearing down (a
+            # FAILURE from the monitoring daemon waits too, harmlessly). A
+            # CANCELED run's worker is still running only if nothing signalled
+            # it (force-terminate, or Dagster's cancel timeout), and a task
+            # still pulling or starting for a finished run is a late start:
+            # both are stopped now.
             finished_at = record.end_time or record.update_timestamp.timestamp()
             if now - finished_at < cls._FINISHED_RUN_GRACE_SECONDS:
                 return None
