@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "dagster-docker-swarm"
-version = "0.2.2"
+version = "0.2.3"
 description = "A Dagster run launcher that executes pipeline runs as Docker Swarm services"
 readme = "README.md"
 license = { text = "Apache-2.0" }
@@ -17,6 +17,8 @@ classifiers = [
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
     "License :: OSI Approved :: Apache Software License",
     "Operating System :: OS Independent",
 ]
@@ -34,11 +36,18 @@ dev = [
 
 [project.urls]
 Homepage = "https://github.com/ffwright/dagster-docker-swarm"
+Changelog = "https://github.com/ffwright/dagster-docker-swarm/blob/main/CHANGELOG.md"
 Repository = "https://github.com/ffwright/dagster-docker-swarm"
 Issues = "https://github.com/ffwright/dagster-docker-swarm/issues"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/dagster_docker_swarm"]
+
+[tool.hatch.build.targets.sdist]
+# Hatchling honours this repo's .gitignore but not personal git excludes, so an
+# sdist built from a working tree would otherwise pick up local files (editor
+# settings, review notes, scratch patches). 0.2.1's sdist shipped one.
+only-include = ["src", "tests", "README.md", "CHANGELOG.md", "LICENSE", "pyproject.toml"]
 
 [tool.ruff]
 line-length = 120

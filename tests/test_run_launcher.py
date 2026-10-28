@@ -1,10 +1,13 @@
 import logging
+import re
 import time
+from datetime import datetime, timezone
 from unittest.mock import MagicMock, patch
 
 import docker.errors
 import pytest
 from dagster._core.errors import DagsterInvariantViolationError
+from dagster._core.storage.dagster_run import DagsterRunStatus
 
 from dagster_docker_swarm.container_context import DOCKER_SWARM_CONTAINER_CONTEXT_KEY
 from dagster_docker_swarm.run_launcher import (
@@ -14,7 +17,7 @@ from dagster_docker_swarm.run_launcher import (
     _missing_docker_socket_path,
     _MissingDockerSocketError,
 )
-from tests.conftest import make_mock_job_code_origin, make_mock_run
+from tests.conftest import make_mock_job_code_origin, make_mock_run, make_mock_run_record
 
 
 class TestSwarmRunLauncherInit:
@@ -89,6 +92,23 @@ class TestCheckRunWorkerHealth:
             filters={"label": f"dagster/run_id={run.run_id}"}
         )
 
+    def test_does_not_log_in_to_registry(self, mock_docker_client):
+        """Inspecting a service needs no registry auth, so a registry outage cannot fail a health check."""
+        mock_docker_client.login.side_effect = docker.errors.APIError("registry unavailable")
+        service = MagicMock()
+        service.id = "svc-1"
+        service.tasks.return_value = [{"UpdatedAt": "2025-01-01T00:00:00Z", "Status": {"State": "running"}}]
+        mock_docker_client.services.get.return_value = service
+        with patch("docker.client.from_env", return_value=mock_docker_client):
+            launcher = SwarmRunLauncher(
+                cleanup_interval=0, registry={"url": "r.io", "username": "u", "password": "p"},
+            )
+
+        result = launcher.check_run_worker_health(make_mock_run(tags={SWARM_SERVICE_ID_TAG: "svc-1"}))
+
+        assert result.status.name == "RUNNING"
+        mock_docker_client.login.assert_not_called()
+
     def test_no_service_id_tag_falls_back_to_run_label(self, mock_docker_client):
         # The tag can be lost from run_body when add_run_tags races the run
         # worker's PIPELINE_START write; the labelled service is still there.
@@ -105,11 +125,21 @@ class TestCheckRunWorkerHealth:
         mock_docker_client.services.get.assert_not_called()
 
     def test_no_service_id_tag_label_lookup_api_error(self, mock_docker_client):
+        """An API error is not evidence the worker is gone: NOT_FOUND would get a
+        healthy run failed and its service swept. Monitoring retries on its next poll."""
         mock_docker_client.services.list.side_effect = docker.errors.APIError("boom")
         launcher = self._make_launcher(mock_docker_client)
         run = make_mock_run(tags={})
-        result = launcher.check_run_worker_health(run)
-        assert result.status.name == "NOT_FOUND"
+        with pytest.raises(docker.errors.APIError):
+            launcher.check_run_worker_health(run)
+
+    def test_service_lookup_api_error_propagates(self, mock_docker_client):
+        mock_docker_client.services.get.side_effect = docker.errors.APIError("503 not a swarm manager")
+        launcher = self._make_launcher(mock_docker_client)
+        run = make_mock_run(tags={SWARM_SERVICE_ID_TAG: "svc-123"})
+        with pytest.raises(docker.errors.APIError):
+            launcher.check_run_worker_health(run)
+        mock_docker_client.services.list.assert_not_called()
 
     def test_service_not_found(self, mock_docker_client):
         mock_docker_client.services.get.side_effect = docker.errors.NotFound("gone")
@@ -216,14 +246,85 @@ class TestCheckRunWorkerHealth:
         assert result.status.name == "RUNNING"
 
 
+class TestRemovalReason:
+    """The sweep's decision for one service, from its task state and run record."""
+
+    GRACE = SwarmRunLauncher._FINISHED_RUN_GRACE_SECONDS
+    NOW = 1_800_000_000.0
+
+    def _reason(self, task_state, status=None, end_time=None, update_timestamp=None, in_storage=True):
+        record = None
+        if in_storage:
+            kwargs = {"update_timestamp": update_timestamp} if update_timestamp else {}
+            record = make_mock_run_record(status=status, end_time=end_time, **kwargs)
+        return SwarmRunLauncher._removal_reason(task_state, record, self.NOW)
+
+    @pytest.mark.parametrize("task_state", ("complete", "failed", "rejected", "orphaned", "shutdown"))
+    def test_run_not_in_storage_removed_once_task_terminal(self, task_state):
+        assert self._reason(task_state, in_storage=False) == f"task {task_state}, run not in storage"
+
+    @pytest.mark.parametrize("task_state", (None, "pending", "preparing", "running"))
+    def test_run_not_in_storage_kept_while_task_not_terminal(self, task_state):
+        """May belong to another Dagster instance on the same swarm."""
+        assert self._reason(task_state, in_storage=False) is None
+
+    @pytest.mark.parametrize("status", (DagsterRunStatus.STARTING, DagsterRunStatus.STARTED))
+    @pytest.mark.parametrize("task_state", (None, "new", "pending", "preparing", "running", "complete"))
+    def test_run_in_progress_kept(self, status, task_state):
+        assert self._reason(task_state, status=status) is None
+
+    @pytest.mark.parametrize("task_state", (None, "pending", "running", "complete"))
+    def test_canceling_run_removed(self, task_state):
+        """terminate() could not reach Docker; removing the service stops the worker."""
+        reason = self._reason(task_state, status=DagsterRunStatus.CANCELING)
+        assert reason is not None
+        assert reason.startswith("run CANCELING")
+
+    @pytest.mark.parametrize(
+        "status", (DagsterRunStatus.SUCCESS, DagsterRunStatus.FAILURE, DagsterRunStatus.CANCELED)
+    )
+    @pytest.mark.parametrize(
+        "task_state", (None, "new", "pending", "assigned", "accepted", "preparing", "starting")
+    )
+    def test_finished_run_with_task_not_running_removed(self, status, task_state):
+        """START_TIMEOUT leaves a FAILURE run whose task never started, holding its IPs."""
+        reason = self._reason(task_state, status=status, end_time=self.NOW)
+        assert reason == f"run {status.value}, task {task_state or 'not created'}"
+
+    def test_finished_run_running_task_kept_within_grace(self):
+        """The worker can still be tearing down after it wrote the run's last event."""
+        assert self._reason("running", status=DagsterRunStatus.SUCCESS, end_time=self.NOW - 5) is None
+
+    @pytest.mark.parametrize(
+        "status", (DagsterRunStatus.SUCCESS, DagsterRunStatus.FAILURE, DagsterRunStatus.CANCELED)
+    )
+    def test_finished_run_running_task_removed_after_grace(self, status):
+        reason = self._reason("running", status=status, end_time=self.NOW - self.GRACE)
+        assert reason == f"run {status.value}, task running"
+
+    def test_grace_falls_back_to_update_timestamp_without_end_time(self):
+        """Run storage without the run-stats columns leaves end_time unset."""
+        recent = datetime.fromtimestamp(self.NOW - 5, tz=timezone.utc)
+        old = datetime.fromtimestamp(self.NOW - self.GRACE - 1, tz=timezone.utc)
+        assert self._reason("running", status=DagsterRunStatus.FAILURE, update_timestamp=recent) is None
+        assert self._reason("running", status=DagsterRunStatus.FAILURE, update_timestamp=old) is not None
+
+    def test_canceled_run_running_task_removed_without_grace(self):
+        """Nothing signalled this worker (force-terminate or the cancel timeout), so
+        waiting only lets it keep executing steps."""
+        reason = self._reason("running", status=DagsterRunStatus.CANCELED, end_time=self.NOW)
+        assert reason == "run CANCELED, task running"
+
+
 class TestCleanupOrphanedServices:
-    """Tests for the background cleanup thread and sweep logic."""
+    """Tests for the sweep: Docker and run storage calls around _removal_reason."""
 
     def _make_launcher_with_instance(self, mock_docker_client, cleanup_interval=0):
         """Create a launcher with cleanup thread disabled (interval=0) for direct testing."""
         with patch("docker.client.from_env", return_value=mock_docker_client):
             launcher = SwarmRunLauncher(cleanup_interval=cleanup_interval)
             mock_instance = MagicMock()
+            mock_instance.get_run_records.return_value = []
             launcher.register_instance(mock_instance)
             return launcher, mock_instance
 
@@ -242,8 +343,9 @@ class TestCleanupOrphanedServices:
         mock_docker_client.services.list.return_value = [orphan]
 
         launcher, mock_instance = self._make_launcher_with_instance(mock_docker_client)
-        finished_run = make_mock_run(run_id="run-aaa", is_finished=True)
-        mock_instance.get_run_by_id.return_value = finished_run
+        mock_instance.get_run_records.return_value = [
+            make_mock_run_record(run_id="run-aaa", status=DagsterRunStatus.SUCCESS)
+        ]
 
         launcher._cleanup_orphaned_services()
 
@@ -253,8 +355,7 @@ class TestCleanupOrphanedServices:
         orphan = self._make_orphaned_service(run_id="run-deleted", task_state="complete")
         mock_docker_client.services.list.return_value = [orphan]
 
-        launcher, mock_instance = self._make_launcher_with_instance(mock_docker_client)
-        mock_instance.get_run_by_id.return_value = None  # run deleted from DB
+        launcher, _ = self._make_launcher_with_instance(mock_docker_client)  # run deleted from DB
 
         launcher._cleanup_orphaned_services()
 
@@ -266,27 +367,94 @@ class TestCleanupOrphanedServices:
         mock_docker_client.services.list.return_value = [service]
 
         launcher, mock_instance = self._make_launcher_with_instance(mock_docker_client)
-        active_run = make_mock_run(run_id="run-active", is_finished=False)
-        mock_instance.get_run_by_id.return_value = active_run
+        mock_instance.get_run_records.return_value = [
+            make_mock_run_record(run_id="run-active", status=DagsterRunStatus.STARTED)
+        ]
 
         launcher._cleanup_orphaned_services()
 
         service.remove.assert_not_called()
 
-    def test_skips_service_with_running_task(self, mock_docker_client):
-        service = MagicMock()
-        service.attrs = {"Spec": {"Labels": {"dagster/run_id": "run-bbb"}}}
-        service.tasks.return_value = [
-            {"Status": {"State": "running"}, "UpdatedAt": "2025-01-01T00:00:00Z"},
+    def test_removes_pending_service_of_timed_out_run(self, mock_docker_client):
+        """START_TIMEOUT marks the run FAILURE without terminating; its task never left pending."""
+        stuck = self._make_orphaned_service(run_id="run-timed-out", task_state="pending")
+        mock_docker_client.services.list.return_value = [stuck]
+
+        launcher, mock_instance = self._make_launcher_with_instance(mock_docker_client)
+        mock_instance.get_run_records.return_value = [
+            make_mock_run_record(run_id="run-timed-out", status=DagsterRunStatus.FAILURE)
         ]
+
+        launcher._cleanup_orphaned_services()
+
+        stuck.remove.assert_called_once()
+
+    def test_removes_running_worker_of_canceling_run(self, mock_docker_client):
+        """terminate() from the webserver leaves the run CANCELING; the sweep stops the worker."""
+        service = self._make_orphaned_service(run_id="run-terminated", task_state="running")
         mock_docker_client.services.list.return_value = [service]
+
+        launcher, mock_instance = self._make_launcher_with_instance(mock_docker_client)
+        mock_instance.get_run_records.return_value = [
+            make_mock_run_record(run_id="run-terminated", status=DagsterRunStatus.CANCELING)
+        ]
+
+        launcher._cleanup_orphaned_services()
+
+        service.remove.assert_called_once()
+
+    def test_looks_up_all_runs_in_one_query(self, mock_docker_client):
+        services = [self._make_orphaned_service(run_id=f"run-{i}") for i in (2, 1, 2)]
+        mock_docker_client.services.list.return_value = services
 
         launcher, mock_instance = self._make_launcher_with_instance(mock_docker_client)
 
         launcher._cleanup_orphaned_services()
 
-        service.remove.assert_not_called()
-        mock_instance.get_run_by_id.assert_not_called()  # shouldn't even check
+        mock_instance.get_run_records.assert_called_once()
+        assert mock_instance.get_run_records.call_args.kwargs["filters"].run_ids == ["run-1", "run-2"]
+        mock_instance.get_run_by_id.assert_not_called()
+
+    def test_skips_sweep_when_run_storage_unreadable(self, mock_docker_client):
+        """A failed lookup must not make every run look deleted."""
+        orphan = self._make_orphaned_service(run_id="run-aaa", task_state="complete")
+        mock_docker_client.services.list.return_value = [orphan]
+
+        launcher, mock_instance = self._make_launcher_with_instance(mock_docker_client)
+        mock_instance.get_run_records.side_effect = Exception("database is locked")
+
+        launcher._cleanup_orphaned_services()
+
+        orphan.remove.assert_not_called()
+
+    def test_no_storage_query_without_run_ids(self, mock_docker_client):
+        """With no run IDs there is nothing to look up (and RunsFilter(run_ids=[]) raises)."""
+        unlabeled = MagicMock()
+        unlabeled.attrs = {"Spec": {"Labels": {"dagster/run_id": ""}}}
+        unlabeled.tasks.return_value = [
+            {"Status": {"State": "complete"}, "UpdatedAt": "2025-01-01T00:00:00Z"},
+        ]
+        mock_docker_client.services.list.return_value = [unlabeled]
+
+        launcher, mock_instance = self._make_launcher_with_instance(mock_docker_client)
+
+        launcher._cleanup_orphaned_services()
+
+        mock_instance.get_run_records.assert_not_called()
+        unlabeled.remove.assert_called_once()
+
+    def test_null_labels_do_not_abort_sweep(self, mock_docker_client):
+        odd = MagicMock()
+        odd.attrs = {"Spec": {"Labels": None}}
+        odd.tasks.return_value = []
+        orphan = self._make_orphaned_service(run_id="run-aaa", task_state="complete")
+        mock_docker_client.services.list.return_value = [odd, orphan]
+
+        launcher, _ = self._make_launcher_with_instance(mock_docker_client)
+
+        launcher._cleanup_orphaned_services()
+
+        orphan.remove.assert_called_once()
 
     def test_handles_already_removed_service(self, mock_docker_client):
         """NotFound during remove is silently ignored (another path cleaned it)."""
@@ -294,8 +462,7 @@ class TestCleanupOrphanedServices:
         orphan.remove.side_effect = docker.errors.NotFound("already gone")
         mock_docker_client.services.list.return_value = [orphan]
 
-        launcher, mock_instance = self._make_launcher_with_instance(mock_docker_client)
-        mock_instance.get_run_by_id.return_value = None
+        launcher, _ = self._make_launcher_with_instance(mock_docker_client)
 
         # Should not raise
         launcher._cleanup_orphaned_services()
@@ -316,8 +483,7 @@ class TestCleanupOrphanedServices:
             services.append(svc)
         mock_docker_client.services.list.return_value = services
 
-        launcher, mock_instance = self._make_launcher_with_instance(mock_docker_client)
-        mock_instance.get_run_by_id.return_value = None  # all deleted
+        launcher, _ = self._make_launcher_with_instance(mock_docker_client)  # all deleted
 
         launcher._cleanup_orphaned_services()
 
@@ -390,6 +556,11 @@ class TestCleanupThread:
 
 
 class TestTerminate:
+    @pytest.fixture(autouse=True)
+    def _docker_socket_present(self):
+        with patch("dagster_docker_swarm.run_launcher._missing_docker_socket_path", return_value=None):
+            yield
+
     def _make_launcher_with_instance(self, mock_docker_client):
         with patch("docker.client.from_env", return_value=mock_docker_client):
             launcher = SwarmRunLauncher(cleanup_interval=0)
@@ -431,6 +602,86 @@ class TestTerminate:
         mock_docker_client.services.list.assert_called_once_with(
             filters={"label": f"dagster/run_id={run.run_id}"}
         )
+
+    def test_terminate_service_already_removed(self, mock_docker_client):
+        """The cleanup sweep got there first: the worker is stopping either way."""
+        service = MagicMock()
+        service.remove.side_effect = docker.errors.NotFound("gone")
+        mock_docker_client.services.get.return_value = service
+        launcher, mock_instance = self._make_launcher_with_instance(mock_docker_client)
+        run = make_mock_run(tags={SWARM_SERVICE_ID_TAG: "svc-123"})
+        mock_instance.get_run_by_id.return_value = run
+        assert launcher.terminate(run.run_id) is True
+
+    @pytest.mark.parametrize("failing_call", ("lookup", "remove"))
+    def test_terminate_docker_error_hands_off_to_cleanup(self, mock_docker_client, failing_call):
+        """Raising would fail a cancelling backfill or abandon a bulk terminate;
+        the run is CANCELING, so the sweep stops the worker once Docker answers."""
+        error = docker.errors.APIError("Service Unavailable", response=MagicMock(status_code=503))
+        service = MagicMock()
+        if failing_call == "lookup":
+            mock_docker_client.services.get.side_effect = error
+        else:
+            mock_docker_client.services.get.return_value = service
+            service.remove.side_effect = error
+        launcher, mock_instance = self._make_launcher_with_instance(mock_docker_client)
+        launcher._cleanup_interval = 300
+        run = make_mock_run(tags={SWARM_SERVICE_ID_TAG: "svc-123"})
+        mock_instance.get_run_by_id.return_value = run
+
+        assert launcher.terminate(run.run_id) is True
+
+        mock_instance.report_run_canceling.assert_called_once_with(run)
+        message = mock_instance.report_engine_event.call_args.kwargs["message"]
+        assert "Docker error (503)" in message
+        assert "every 300s" in message
+
+    def test_terminate_docker_error_with_cleanup_disabled(self, mock_docker_client):
+        mock_docker_client.services.get.side_effect = docker.errors.APIError("boom")
+        launcher, mock_instance = self._make_launcher_with_instance(mock_docker_client)
+        run = make_mock_run(tags={SWARM_SERVICE_ID_TAG: "svc-123"})
+        mock_instance.get_run_by_id.return_value = run
+
+        assert launcher.terminate(run.run_id) is False
+
+        message = mock_instance.report_engine_event.call_args.kwargs["message"]
+        assert "cleanup is disabled" in message
+
+    def test_terminate_without_socket_hands_off_to_cleanup(self, mock_docker_client):
+        """In the webserver: leave the run CANCELING for the daemon's sweep."""
+        launcher, mock_instance = self._make_launcher_with_instance(mock_docker_client)
+        launcher._cleanup_interval = 300  # as configured for the daemon; no thread needed here
+        run = make_mock_run(tags={SWARM_SERVICE_ID_TAG: "svc-123"})
+        mock_instance.get_run_by_id.return_value = run
+
+        with patch(
+            "dagster_docker_swarm.run_launcher._missing_docker_socket_path",
+            return_value="/var/run/docker.sock",
+        ):
+            assert launcher.terminate(run.run_id) is True
+
+        mock_instance.report_run_canceling.assert_called_once_with(run)
+        message = mock_instance.report_engine_event.call_args.kwargs["message"]
+        assert "/var/run/docker.sock" in message
+        assert "every 300s" in message
+        mock_docker_client.services.get.assert_not_called()
+        mock_docker_client.services.list.assert_not_called()
+
+    def test_terminate_without_socket_and_cleanup_disabled(self, mock_docker_client):
+        """Nothing will ever stop the worker, so report failure."""
+        launcher, mock_instance = self._make_launcher_with_instance(mock_docker_client)
+        run = make_mock_run(tags={SWARM_SERVICE_ID_TAG: "svc-123"})
+        mock_instance.get_run_by_id.return_value = run
+
+        with patch(
+            "dagster_docker_swarm.run_launcher._missing_docker_socket_path",
+            return_value="/var/run/docker.sock",
+        ):
+            assert launcher.terminate(run.run_id) is False
+
+        message = mock_instance.report_engine_event.call_args.kwargs["message"]
+        assert "cleanup is disabled" in message
+        mock_docker_client.services.get.assert_not_called()
 
 
 class TestLaunchService:
@@ -572,9 +823,100 @@ class TestLaunchService:
         call_kwargs = mock_docker_client.services.create.call_args.kwargs
         assert call_kwargs["user"] == "dagster"
 
+    def test_service_kwargs_labels_merged_launcher_labels_win(self, mock_docker_client):
+        """A user's labels reach the service; the launcher's dagster/* labels cannot be replaced."""
+        self._setup_create(mock_docker_client)
+        launcher, _ = self._make_launcher_with_instance(
+            mock_docker_client,
+            image="img:v1",
+            service_kwargs={"labels": {"app": "dagster", "dagster/run_id": "someone-else"}},
+        )
+        origin = make_mock_job_code_origin(container_image="img:v1")
+        run = make_mock_run()
+
+        with patch("dagster_docker_swarm.run_launcher.ExecuteRunArgs") as MockArgs:
+            MockArgs.return_value.get_command_args.return_value = ["dagster", "api", "execute_run"]
+            launcher.launch_run(self._make_context(run, origin))
+
+        assert mock_docker_client.services.create.call_args.kwargs["labels"] == {
+            "app": "dagster",
+            "dagster/run_id": run.run_id,
+            "dagster/job_name": "my_job",
+        }
+
+    @pytest.mark.parametrize(
+        "service_kwargs, expected",
+        [
+            ({"env": ["A=1"]}, "env (use env_vars)"),
+            ({"restart_policy": {"Condition": "any"}}, "restart_policy (Swarm must never restart a run)"),
+            ({"mode": {}, "networks": ["n"]}, "mode (each run is a single replica), networks (use networks)"),
+            ({"labels": ["app=dagster"]}, "service_kwargs.labels must map each label to its value, not be a list"),
+            (
+                {"resources": {"mem_limit": "16g", "Limits": {"MemoryBytes": 1}}},
+                "service_kwargs.resources has keys the Docker engine ignores: mem_limit,",
+            ),
+        ],
+    )
+    def test_service_kwargs_set_by_launcher_rejected(self, mock_docker_client, service_kwargs, expected):
+        """A key the launcher passes itself fails the launch with a named error, before any Docker call."""
+        launcher, _ = self._make_launcher_with_instance(
+            mock_docker_client, image="img:v1", service_kwargs=service_kwargs,
+        )
+        origin = make_mock_job_code_origin(container_image="img:v1")
+
+        with patch("dagster_docker_swarm.run_launcher.ExecuteRunArgs") as MockArgs:
+            MockArgs.return_value.get_command_args.return_value = ["dagster", "api", "execute_run"]
+            with pytest.raises(DagsterInvariantViolationError, match=re.escape(expected)):
+                launcher.launch_run(self._make_context(make_mock_run(), origin))
+
+        mock_docker_client.services.create.assert_not_called()
+
+    def test_service_kwargs_engine_shaped_resources_passed_through(self, mock_docker_client):
+        self._setup_create(mock_docker_client)
+        resources = {
+            "Reservations": {"MemoryBytes": 2147483648, "NanoCPUs": 500000000},
+            "Limits": {"MemoryBytes": 17179869184, "NanoCPUs": 4000000000},
+        }
+        launcher, _ = self._make_launcher_with_instance(
+            mock_docker_client, image="img:v1", service_kwargs={"resources": resources},
+        )
+        origin = make_mock_job_code_origin(container_image="img:v1")
+
+        with patch("dagster_docker_swarm.run_launcher.ExecuteRunArgs") as MockArgs:
+            MockArgs.return_value.get_command_args.return_value = ["dagster", "api", "execute_run"]
+            launcher.launch_run(self._make_context(make_mock_run(), origin))
+
+        assert mock_docker_client.services.create.call_args.kwargs["resources"] == resources
+
+    def test_mount_options_passed_through(self, mock_docker_client, caplog):
+        """read_only and the other Mount options are honoured; a tmpfs mount needs no source."""
+        self._setup_create(mock_docker_client)
+        launcher, _ = self._make_launcher_with_instance(
+            mock_docker_client,
+            image="img:v1",
+            mounts=[
+                {"target": "/ref", "source": "/srv/ref", "type": "bind", "read_only": True},
+                {"target": "/scratch", "type": "tmpfs", "tmpfs_size": 1024},
+                {"target": "/data", "source": "vol", "readonly": True},
+            ],
+        )
+        origin = make_mock_job_code_origin(container_image="img:v1")
+
+        with patch("dagster_docker_swarm.run_launcher.ExecuteRunArgs") as MockArgs:
+            MockArgs.return_value.get_command_args.return_value = ["dagster", "api", "execute_run"]
+            with caplog.at_level(logging.WARNING, logger="dagster_docker_swarm"):
+                launcher.launch_run(self._make_context(make_mock_run(), origin))
+
+        bind, tmpfs, volume = mock_docker_client.services.create.call_args.kwargs["mounts"]
+        assert bind["ReadOnly"] is True
+        assert tmpfs["Source"] is None
+        assert tmpfs["TmpfsOptions"] == {"SizeBytes": 1024}
+        assert volume["ReadOnly"] is False
+        assert "Ignoring unknown option(s) ['readonly'] on the mount at /data" in caplog.text
+
     def test_launch_run_reports_engine_event_and_tags(self, mock_docker_client):
         """Engine event is reported and service ID / image tags are added to the run."""
-        mock_service = self._setup_create(mock_docker_client, service_id="svc-abc")
+        self._setup_create(mock_docker_client, service_id="svc-abc")
         launcher, mock_instance = self._make_launcher_with_instance(
             mock_docker_client, image="img:v1",
         )
