@@ -648,13 +648,51 @@ class SwarmRunLauncher(RunLauncher, ConfigurableClass):
         return CheckRunHealthResult(WorkerStatus.RUNNING)
 
     def terminate(self, run_id: str) -> bool:
+        """Stop a run's worker by removing its Swarm service.
+
+        Dagster calls this in whichever process served the terminate request.
+        For a request from the UI that is the webserver, which has no Docker
+        socket. There the run is left CANCELING and the daemon's cleanup sweep
+        removes the service on its next pass (see ``_removal_reason``). That
+        relies on the daemon loading the same ``cleanup_interval`` as this
+        process, as it does when both read one dagster.yaml.
+        """
         run = self._instance.get_run_by_id(run_id)
         if not run or run.is_finished:
             logger.debug("Terminate called for run %s but run is already finished or not found", run_id)
             return False
 
         logger.info("Terminating run %s", run_id)
+        # CANCELING is also the hand-off to the cleanup sweep when this process
+        # cannot reach Docker, so it is reported before anything else.
         self._instance.report_run_canceling(run)
+
+        socket_path = _missing_docker_socket_path()
+        if socket_path is not None:
+            if self._cleanup_interval <= 0:
+                message = (
+                    f"No Docker socket at {socket_path} in this process and Swarm service "
+                    "cleanup is disabled (cleanup_interval: 0), so nothing can stop the "
+                    "run's Swarm service."
+                )
+                self._instance.report_engine_event(message=message, dagster_run=run, cls=self.__class__)
+                logger.warning("Cannot terminate run %s: %s", run_id, message)
+                return False
+            self._instance.report_engine_event(
+                message=(
+                    f"No Docker socket at {socket_path} in this process. The Dagster daemon's "
+                    f"Swarm service cleanup (every {self._cleanup_interval}s) will remove the "
+                    "run's service, which stops the run worker."
+                ),
+                dagster_run=run,
+                cls=self.__class__,
+            )
+            logger.info(
+                "No Docker socket at %s; run %s left CANCELING for the daemon's cleanup sweep",
+                socket_path,
+                run_id,
+            )
+            return True
 
         service = self._get_service(run)
         if not service:
@@ -670,6 +708,10 @@ class SwarmRunLauncher(RunLauncher, ConfigurableClass):
         try:
             service.remove()
             logger.info("Removed Swarm service %s for terminated run %s", service_id, run_id)
+        except docker.errors.NotFound:
+            # The cleanup sweep or a health check removed it between the lookup
+            # and here; the worker is stopping either way.
+            logger.info("Swarm service %s for run %s was already removed", service_id, run_id)
         except docker.errors.APIError:
             logger.exception("Failed to remove Swarm service %s for run %s", service_id, run_id)
             raise

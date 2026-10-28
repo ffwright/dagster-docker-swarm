@@ -120,12 +120,26 @@ single warning and exits, rather than raising on every sweep. Transient Docker
 errors — an engine restart, say — are retried as normal, so cleanup in the
 daemon survives them.
 
+### Terminating runs
+
+Dagster calls `terminate` in the process that served the request, so a run
+terminated from the UI is terminated inside the webserver, which has no Docker
+socket. There the launcher marks the run CANCELING, records an engine event, and
+leaves the rest to the daemon: its next sweep removes the run's service, the
+worker receives SIGTERM, and Dagster records the run as CANCELED. Expect the
+worker to stop within one `cleanup_interval`. The UI's force-terminate option
+marks the run CANCELED straight away, so the worker also gets the 60-second
+grace before the sweep removes it. This relies on the daemon and the
+webserver reading the same `cleanup_interval`; with `cleanup_interval: 0`,
+`terminate` in a process without the socket reports that it cannot stop the
+run.
+
 ## Features
 
 - Launches each Dagster run as an isolated Swarm service (replicas=1, restart=none)
 - Run resume support for interrupted runs
 - Health checking via Swarm task state inspection
-- Automatic cleanup of completed/failed Swarm services via background thread
+- Automatic cleanup of finished runs' Swarm services via background thread
 - Private registry authentication
 - NFS and custom volume driver mounts
 - Passthrough `service_kwargs` for advanced Swarm service configuration

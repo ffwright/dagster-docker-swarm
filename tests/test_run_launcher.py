@@ -522,6 +522,11 @@ class TestCleanupThread:
 
 
 class TestTerminate:
+    @pytest.fixture(autouse=True)
+    def _docker_socket_present(self):
+        with patch("dagster_docker_swarm.run_launcher._missing_docker_socket_path", return_value=None):
+            yield
+
     def _make_launcher_with_instance(self, mock_docker_client):
         with patch("docker.client.from_env", return_value=mock_docker_client):
             launcher = SwarmRunLauncher(cleanup_interval=0)
@@ -563,6 +568,52 @@ class TestTerminate:
         mock_docker_client.services.list.assert_called_once_with(
             filters={"label": f"dagster/run_id={run.run_id}"}
         )
+
+    def test_terminate_service_already_removed(self, mock_docker_client):
+        """The cleanup sweep got there first: the worker is stopping either way."""
+        service = MagicMock()
+        service.remove.side_effect = docker.errors.NotFound("gone")
+        mock_docker_client.services.get.return_value = service
+        launcher, mock_instance = self._make_launcher_with_instance(mock_docker_client)
+        run = make_mock_run(tags={SWARM_SERVICE_ID_TAG: "svc-123"})
+        mock_instance.get_run_by_id.return_value = run
+        assert launcher.terminate(run.run_id) is True
+
+    def test_terminate_without_socket_hands_off_to_cleanup(self, mock_docker_client):
+        """In the webserver: leave the run CANCELING for the daemon's sweep."""
+        launcher, mock_instance = self._make_launcher_with_instance(mock_docker_client)
+        launcher._cleanup_interval = 300  # as configured for the daemon; no thread needed here
+        run = make_mock_run(tags={SWARM_SERVICE_ID_TAG: "svc-123"})
+        mock_instance.get_run_by_id.return_value = run
+
+        with patch(
+            "dagster_docker_swarm.run_launcher._missing_docker_socket_path",
+            return_value="/var/run/docker.sock",
+        ):
+            assert launcher.terminate(run.run_id) is True
+
+        mock_instance.report_run_canceling.assert_called_once_with(run)
+        message = mock_instance.report_engine_event.call_args.kwargs["message"]
+        assert "/var/run/docker.sock" in message
+        assert "every 300s" in message
+        mock_docker_client.services.get.assert_not_called()
+        mock_docker_client.services.list.assert_not_called()
+
+    def test_terminate_without_socket_and_cleanup_disabled(self, mock_docker_client):
+        """Nothing will ever stop the worker, so report failure."""
+        launcher, mock_instance = self._make_launcher_with_instance(mock_docker_client)
+        run = make_mock_run(tags={SWARM_SERVICE_ID_TAG: "svc-123"})
+        mock_instance.get_run_by_id.return_value = run
+
+        with patch(
+            "dagster_docker_swarm.run_launcher._missing_docker_socket_path",
+            return_value="/var/run/docker.sock",
+        ):
+            assert launcher.terminate(run.run_id) is False
+
+        message = mock_instance.report_engine_event.call_args.kwargs["message"]
+        assert "cleanup is disabled" in message
+        mock_docker_client.services.get.assert_not_called()
 
 
 class TestLaunchService:
