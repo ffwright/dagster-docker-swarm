@@ -107,11 +107,21 @@ class TestCheckRunWorkerHealth:
         mock_docker_client.services.get.assert_not_called()
 
     def test_no_service_id_tag_label_lookup_api_error(self, mock_docker_client):
+        """An API error is not evidence the worker is gone: NOT_FOUND would get a
+        healthy run failed and its service swept. Monitoring retries on its next poll."""
         mock_docker_client.services.list.side_effect = docker.errors.APIError("boom")
         launcher = self._make_launcher(mock_docker_client)
         run = make_mock_run(tags={})
-        result = launcher.check_run_worker_health(run)
-        assert result.status.name == "NOT_FOUND"
+        with pytest.raises(docker.errors.APIError):
+            launcher.check_run_worker_health(run)
+
+    def test_service_lookup_api_error_propagates(self, mock_docker_client):
+        mock_docker_client.services.get.side_effect = docker.errors.APIError("503 not a swarm manager")
+        launcher = self._make_launcher(mock_docker_client)
+        run = make_mock_run(tags={SWARM_SERVICE_ID_TAG: "svc-123"})
+        with pytest.raises(docker.errors.APIError):
+            launcher.check_run_worker_health(run)
+        mock_docker_client.services.list.assert_not_called()
 
     def test_service_not_found(self, mock_docker_client):
         mock_docker_client.services.get.side_effect = docker.errors.NotFound("gone")

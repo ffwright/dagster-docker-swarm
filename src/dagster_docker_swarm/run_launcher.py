@@ -242,6 +242,15 @@ class SwarmRunLauncher(RunLauncher, ConfigurableClass):
         return docker_image
 
     def _get_service(self, run: DagsterRun) -> Optional[Service]:
+        """Return the run's Swarm service, or ``None`` if Docker says it does not exist.
+
+        Only ``NotFound`` means "no service". Any other Docker API error (an
+        engine restart, a 503 during a manager election) propagates: ``None``
+        makes check_run_worker_health report NOT_FOUND, the monitoring daemon
+        then fails the run, and the cleanup sweep removes the service of a
+        worker that was healthy. Monitoring catches the exception per run and
+        checks again on its next poll.
+        """
         if not run:
             return None
         service_id = run.tags.get(SWARM_SERVICE_ID_TAG)
@@ -254,9 +263,6 @@ class SwarmRunLauncher(RunLauncher, ConfigurableClass):
         except docker.errors.NotFound:
             logger.warning("Swarm service %s not found for run %s", service_id, run.run_id)
             return self._find_service_by_run_label(run)
-        except docker.errors.APIError:
-            logger.exception("Docker API error looking up service %s for run %s", service_id, run.run_id)
-            return None
 
     def _find_service_by_run_label(self, run: DagsterRun) -> Optional[Service]:
         """Find a run's service by its dagster/run_id label when the run's
@@ -270,13 +276,10 @@ class SwarmRunLauncher(RunLauncher, ConfigurableClass):
         comes from the body. The service is still labelled with the run id, so
         look it up that way instead of reporting a live run as NOT_FOUND.
         """
-        try:
-            services = self._get_client().services.list(
-                filters={"label": f"dagster/run_id={run.run_id}"}
-            )
-        except docker.errors.APIError:
-            logger.exception("Docker API error listing services for run %s", run.run_id)
-            return None
+        # A Docker API error propagates; see _get_service.
+        services = self._get_client().services.list(
+            filters={"label": f"dagster/run_id={run.run_id}"}
+        )
         if not services:
             logger.debug("No service labelled dagster/run_id=%s", run.run_id)
             return None
