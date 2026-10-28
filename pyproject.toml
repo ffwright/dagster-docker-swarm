@@ -40,6 +40,12 @@ Issues = "https://github.com/ffwright/dagster-docker-swarm/issues"
 [tool.hatch.build.targets.wheel]
 packages = ["src/dagster_docker_swarm"]
 
+[tool.hatch.build.targets.sdist]
+# Hatchling honours this repo's .gitignore but not personal git excludes, so an
+# sdist built from a working tree would otherwise pick up local files (editor
+# settings, review notes, scratch patches). 0.2.1's sdist shipped one.
+only-include = ["src", "tests", "README.md", "LICENSE", "pyproject.toml"]
+
 [tool.ruff]
 line-length = 120
 target-version = "py310"
