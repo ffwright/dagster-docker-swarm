@@ -70,6 +70,38 @@ def _missing_docker_socket_path() -> Optional[str]:
     return None if os.path.exists(path) else path
 
 
+# services.create arguments the launcher sets itself, with what to do instead.
+# docker-py raises a TypeError naming none of the user's config if
+# service_kwargs passes one of them again.
+_SERVICE_KWARGS_SET_BY_LAUNCHER = {
+    "args": "it is the run's dagster command",
+    "env": "use env_vars",
+    "image": "use the code location's image or the launcher's image field",
+    "mode": "each run is a single replica",
+    "mounts": "use mounts",
+    "name": "it is derived from the run ID",
+    "networks": "use networks",
+    "restart_policy": "Swarm must never restart a run",
+    "secrets": "use secrets",
+}
+
+# docker.types.Mount options passed through from a mounts entry as given.
+_MOUNT_OPTIONS = ("read_only", "consistency", "propagation", "no_copy", "labels", "tmpfs_size", "tmpfs_mode")
+
+
+def _check_service_kwargs(service_kwargs: dict[str, Any]) -> None:
+    clashes = [
+        f"{key} ({_SERVICE_KWARGS_SET_BY_LAUNCHER[key]})"
+        for key in sorted(service_kwargs)
+        if key in _SERVICE_KWARGS_SET_BY_LAUNCHER
+    ]
+    if clashes:
+        raise DagsterInvariantViolationError(
+            "service_kwargs cannot set what the launcher sets on the Swarm service itself: "
+            + ", ".join(clashes)
+        )
+
+
 SWARM_CONFIG_SCHEMA = {
     "image": Field(StringSource, is_required=False),
     "registry": Field(
@@ -343,6 +375,18 @@ class SwarmRunLauncher(RunLauncher, ConfigurableClass):
         docker_env["DAGSTER_RUN_JOB_NAME"] = run.job_name
         logger.debug("Resolved %d environment variables for run %s", len(docker_env), run.run_id)
 
+        service_kwargs = dict(container_context.service_kwargs)
+        _check_service_kwargs(service_kwargs)
+        if service_kwargs:
+            logger.debug("Passing additional service_kwargs: %s", list(service_kwargs.keys()))
+        # A user's labels are kept, but the launcher's win: the cleanup sweep and
+        # the health check's fallback lookup find a run's service by them.
+        labels = {
+            **(service_kwargs.pop("labels", None) or {}),
+            "dagster/run_id": run.run_id,
+            "dagster/job_name": run.job_name,
+        }
+
         client = docker.client.from_env()
         if container_context.registry:
             logger.debug("Logging in to registry %s", container_context.registry["url"])
@@ -352,8 +396,6 @@ class SwarmRunLauncher(RunLauncher, ConfigurableClass):
                 password=container_context.registry["password"],
             )
 
-        labels = {"dagster/run_id": run.run_id, "dagster/job_name": run.job_name}
-
         mounts: list[Mount] = []
         for m in container_context.mounts:
             driver_config = None
@@ -362,20 +404,24 @@ class SwarmRunLauncher(RunLauncher, ConfigurableClass):
                     name=m["driver_config"]["Name"],
                     options=m["driver_config"].get("Options", {}),
                 )
+            unknown = sorted(set(m) - {"target", "source", "type", "driver_config", *_MOUNT_OPTIONS})
+            if unknown:
+                logger.warning(
+                    "Ignoring unknown option(s) %s on the mount at %s for run %s",
+                    unknown, m.get("target"), run.run_id,
+                )
             mounts.append(Mount(
                 target=m["target"],
-                source=m["source"],
+                # A tmpfs mount has no source.
+                source=m.get("source"),
                 type=m.get("type", "volume"),
                 driver_config=driver_config,
+                **{option: m[option] for option in _MOUNT_OPTIONS if option in m},
             ))
         if mounts:
             logger.debug("Configured %d mount(s) for run %s", len(mounts), run.run_id)
 
         secret_refs = self._resolve_secret_references(client, container_context.secrets, run)
-
-        service_kwargs = dict(container_context.service_kwargs)
-        if service_kwargs:
-            logger.debug("Passing additional service_kwargs: %s", list(service_kwargs.keys()))
 
         try:
             service = client.services.create(

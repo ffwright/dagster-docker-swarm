@@ -1,4 +1,5 @@
 import logging
+import re
 import time
 from datetime import datetime, timezone
 from unittest.mock import MagicMock, patch
@@ -805,9 +806,78 @@ class TestLaunchService:
         call_kwargs = mock_docker_client.services.create.call_args.kwargs
         assert call_kwargs["user"] == "dagster"
 
+    def test_service_kwargs_labels_merged_launcher_labels_win(self, mock_docker_client):
+        """A user's labels reach the service; the launcher's dagster/* labels cannot be replaced."""
+        self._setup_create(mock_docker_client)
+        launcher, _ = self._make_launcher_with_instance(
+            mock_docker_client,
+            image="img:v1",
+            service_kwargs={"labels": {"app": "dagster", "dagster/run_id": "someone-else"}},
+        )
+        origin = make_mock_job_code_origin(container_image="img:v1")
+        run = make_mock_run()
+
+        with patch("dagster_docker_swarm.run_launcher.ExecuteRunArgs") as MockArgs:
+            MockArgs.return_value.get_command_args.return_value = ["dagster", "api", "execute_run"]
+            launcher.launch_run(self._make_context(run, origin))
+
+        assert mock_docker_client.services.create.call_args.kwargs["labels"] == {
+            "app": "dagster",
+            "dagster/run_id": run.run_id,
+            "dagster/job_name": "my_job",
+        }
+
+    @pytest.mark.parametrize(
+        "service_kwargs, expected",
+        [
+            ({"env": ["A=1"]}, "env (use env_vars)"),
+            ({"restart_policy": {"Condition": "any"}}, "restart_policy (Swarm must never restart a run)"),
+            ({"mode": {}, "networks": ["n"]}, "mode (each run is a single replica), networks (use networks)"),
+        ],
+    )
+    def test_service_kwargs_set_by_launcher_rejected(self, mock_docker_client, service_kwargs, expected):
+        """A key the launcher passes itself fails the launch with a named error, before any Docker call."""
+        launcher, _ = self._make_launcher_with_instance(
+            mock_docker_client, image="img:v1", service_kwargs=service_kwargs,
+        )
+        origin = make_mock_job_code_origin(container_image="img:v1")
+
+        with patch("dagster_docker_swarm.run_launcher.ExecuteRunArgs") as MockArgs:
+            MockArgs.return_value.get_command_args.return_value = ["dagster", "api", "execute_run"]
+            with pytest.raises(DagsterInvariantViolationError, match=re.escape(expected)):
+                launcher.launch_run(self._make_context(make_mock_run(), origin))
+
+        mock_docker_client.services.create.assert_not_called()
+
+    def test_mount_options_passed_through(self, mock_docker_client, caplog):
+        """read_only and the other Mount options are honoured; a tmpfs mount needs no source."""
+        self._setup_create(mock_docker_client)
+        launcher, _ = self._make_launcher_with_instance(
+            mock_docker_client,
+            image="img:v1",
+            mounts=[
+                {"target": "/ref", "source": "/srv/ref", "type": "bind", "read_only": True},
+                {"target": "/scratch", "type": "tmpfs", "tmpfs_size": 1024},
+                {"target": "/data", "source": "vol", "readonly": True},
+            ],
+        )
+        origin = make_mock_job_code_origin(container_image="img:v1")
+
+        with patch("dagster_docker_swarm.run_launcher.ExecuteRunArgs") as MockArgs:
+            MockArgs.return_value.get_command_args.return_value = ["dagster", "api", "execute_run"]
+            with caplog.at_level(logging.WARNING, logger="dagster_docker_swarm"):
+                launcher.launch_run(self._make_context(make_mock_run(), origin))
+
+        bind, tmpfs, volume = mock_docker_client.services.create.call_args.kwargs["mounts"]
+        assert bind["ReadOnly"] is True
+        assert tmpfs["Source"] is None
+        assert tmpfs["TmpfsOptions"] == {"SizeBytes": 1024}
+        assert volume["ReadOnly"] is False
+        assert "Ignoring unknown option(s) ['readonly'] on the mount at /data" in caplog.text
+
     def test_launch_run_reports_engine_event_and_tags(self, mock_docker_client):
         """Engine event is reported and service ID / image tags are added to the run."""
-        mock_service = self._setup_create(mock_docker_client, service_id="svc-abc")
+        self._setup_create(mock_docker_client, service_id="svc-abc")
         launcher, mock_instance = self._make_launcher_with_instance(
             mock_docker_client, image="img:v1",
         )
